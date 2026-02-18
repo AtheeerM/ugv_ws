@@ -2,8 +2,8 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-import serial  
-import json  
+import serial
+import json
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32, Float32MultiArray
 import subprocess
@@ -15,9 +15,9 @@ def is_jetson():
     return result
 
 if is_jetson():
-    serial_port = '/dev/ttyTHS1'
+    serial_port = "/dev/ttyTHS1"
 else:
-    serial_port = '/dev/ttyAMA0'
+    serial_port = '/dev/ttyACM0'
 
 # Initialize serial communication with the UGV
 ser = serial.Serial(serial_port, 115200, timeout=1)
@@ -105,7 +105,7 @@ class UgvDriver(Node):
 
         # If voltage drops below a threshold, play a low battery warning sound
         if 0.1 < voltage_value < 9: 
-            subprocess.run(['aplay', '-D', 'plughw:3,0', '/home/ws/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/low_battery.wav'])
+            subprocess.run(['aplay', '-D', 'plughw:3,0', '/home/jaj/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/low_battery.wav'])
             time.sleep(5)
 
 def main(args=None):
