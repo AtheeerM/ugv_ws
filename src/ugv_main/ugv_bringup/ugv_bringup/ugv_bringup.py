@@ -19,7 +19,7 @@ def is_jetson():
 if is_jetson():
     serial_port = '/dev/ttyTHS1'
 else:
-    serial_port = '/dev/ttyAMA0'
+    serial_port = '/dev/ttyACM0'
 
 # Helper class for reading lines from a serial port
 class ReadLine:
