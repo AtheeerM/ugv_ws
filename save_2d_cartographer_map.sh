@@ -1,6 +1,6 @@
 #!/bin/bash
-cd /home/ws/ugv_ws/src/ugv_main/ugv_nav/maps
+cd /home/jaj/ugv_ws/src/ugv_main/ugv_nav/maps
 ros2 run nav2_map_server map_saver_cli -f ./map
-ros2 service call /write_state cartographer_ros_msgs/srv/WriteState "{filename: '/home/ws/ugv_ws/src/ugv_main/ugv_nav/maps/map.pbstream'}"
+ros2 service call /write_state cartographer_ros_msgs/srv/WriteState "{filename: '/home/jaj/ugv_ws/src/ugv_main/ugv_nav/maps/map.pbstream'}"
 cd -
 
