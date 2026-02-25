@@ -54,10 +54,9 @@ class Greedy4Goals(Node):
 
         # Replace these with YOUR 4 points
         self.goals = [
-            self.make_goal(1.4691200256347656, -1.1307926177978516, 0.0),
-            self.make_goal(1.905529260635376, -0.2111365646123886, 0.0),
-            self.make_goal(0.4719597101211548,  2.088629722595215, 0.0),
-            self.make_goal(-1.3124245405197144, -0.2761569023132324, 0.0),
+            self.make_goal(-0.84294593334198,  1.9491890668869019, 0.0),
+            self.make_goal(-3.521780252456665, 0.4063647389411926, 0.0),
+            self.make_goal( 0.4273202121257782, 2.102668523788452, 0.0),
         ]
 
         self.running = False
