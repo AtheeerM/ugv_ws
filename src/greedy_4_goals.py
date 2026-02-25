@@ -27,6 +27,7 @@ def path_length(nav_path) -> float:
 
 
 def yaw_to_quat(yaw: float):
+    # planar yaw -> quaternion (z,w), x=y=0
     return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
 
@@ -34,7 +35,7 @@ class Greedy4Goals(Node):
     def __init__(self):
         super().__init__("greedy_4_goals")
 
-        # Nav2 default interfaces (we can change if your names differ)
+        # Nav2 interfaces
         self.nav_action_name = "navigate_to_pose"
         self.plan_service_name = "compute_path_to_pose"
 
@@ -45,7 +46,13 @@ class Greedy4Goals(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # TODO: we will replace these 4 placeholders with your RViz points next
+        # --- TUNABLES ---
+        self.max_goal_attempts_per_cycle = 4   # try up to N best goals each cycle (usually == len(goals))
+        self.retry_delay_sec = 2.0             # if everything fails, wait before trying again
+        self.plan_timeout_sec = 2.0
+        self.action_server_wait_sec = 2.0
+
+        # Replace these with YOUR 4 points
         self.goals = [
             self.make_goal(0.0, 0.0, 0.0),
             self.make_goal(0.0, 0.0, 0.0),
@@ -55,11 +62,13 @@ class Greedy4Goals(Node):
 
         self.running = False
         self.timer = self.create_timer(1.0, self.loop)
-        self.get_logger().info("Greedy4Goals started. Initialize pose in RViz, then run this node.")
+        self.get_logger().info("Greedy4Goals started. Make sure Nav2 is running + pose is initialized in RViz.")
 
     def make_goal(self, x: float, y: float, yaw: float) -> PoseStamped:
         g = PoseStamped()
         g.header.frame_id = "map"
+        # IMPORTANT: timestamp helps TF / Nav2 timing
+        g.header.stamp = self.get_clock().now().to_msg()
         g.pose.position.x = x
         g.pose.position.y = y
         z, w = yaw_to_quat(yaw)
@@ -72,6 +81,7 @@ class Greedy4Goals(Node):
             tf = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
             p = PoseStamped()
             p.header.frame_id = "base_link"
+            p.header.stamp = self.get_clock().now().to_msg()
             p.pose.orientation.w = 1.0
             return do_transform_pose(p, tf)
         except Exception as e:
@@ -83,22 +93,32 @@ class Greedy4Goals(Node):
             self.get_logger().warn(f"Service '{self.plan_service_name}' not available yet")
             return None
 
+        # Stamp both start and goal (Nav2 likes fresh stamps)
+        start.header.stamp = self.get_clock().now().to_msg()
+        goal.header.stamp = self.get_clock().now().to_msg()
+
         req = ComputePathToPose.Request()
         req.start = start
         req.goal = goal
         req.use_start = True
 
         future = self.plan_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=self.plan_timeout_sec)
         if future.result() is None:
             return None
 
         return path_length(future.result().path)
 
-    def navigate_to(self, goal: PoseStamped) -> bool:
-        if not self.nav_client.wait_for_server(timeout_sec=2.0):
+    def navigate_to(self, goal: PoseStamped) -> tuple[bool, int]:
+        """
+        Returns (success, status_code)
+        status_code is action_msgs/GoalStatus value.
+        """
+        if not self.nav_client.wait_for_server(timeout_sec=self.action_server_wait_sec):
             self.get_logger().error(f"Action '{self.nav_action_name}' not available")
-            return False
+            return False, -1
+
+        goal.header.stamp = self.get_clock().now().to_msg()
 
         msg = NavigateToPose.Goal()
         msg.pose = goal
@@ -108,20 +128,24 @@ class Greedy4Goals(Node):
         goal_handle = send_future.result()
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().warn("Goal rejected")
-            return False
+            return False, -2
 
         result_future = goal_handle.get_result_async()
         rclpy.spin_until_future_complete(self, result_future)
-        status = result_future.result().status
+        result = result_future.result()
+        if result is None:
+            return False, -3
 
+        status = result.status
         # action_msgs/GoalStatus: 4 = SUCCEEDED
-        return status == 4
+        return (status == 4), status
 
     def loop(self):
         if self.running:
             return
+
         if len(self.goals) == 0:
-            self.get_logger().info("All 4 destinations completed ✅")
+            self.get_logger().info("All destinations completed ✅")
             self.timer.cancel()
             return
 
@@ -131,28 +155,61 @@ class Greedy4Goals(Node):
 
         self.running = True
 
-        best_i = None
-        best_cost = None
+        # 1) compute cost to every remaining goal
+        scored = []
         for i, g in enumerate(self.goals):
             cost = self.compute_path_cost(start, g)
             if cost is None:
                 continue
-            if best_cost is None or cost < best_cost:
-                best_cost = cost
-                best_i = i
+            scored.append((cost, i))
 
-        if best_i is None:
-            self.get_logger().warn("Could not compute a path to any goal. Check Nav2 is running.")
+        if not scored:
+            self.get_logger().warn("No valid paths to any goal right now. Will retry soon...")
             self.running = False
             return
 
-        next_goal = self.goals.pop(best_i)
-        self.get_logger().info(f"Chosen next goal automatically (cost ~ {best_cost:.2f} m).")
+        # 2) sort by best cost (greedy)
+        scored.sort(key=lambda x: x[0])
 
-        ok = self.navigate_to(next_goal)
-        self.get_logger().info("Reached ✅" if ok else "Failed/aborted ❌")
+        # 3) Try goals from best to worse until one succeeds
+        attempts = 0
+        success_index = None
+
+        for cost, idx in scored:
+            attempts += 1
+            if attempts > self.max_goal_attempts_per_cycle:
+                break
+
+            g = self.goals[idx]
+            self.get_logger().info(f"Trying goal #{idx} (greedy cost ~ {cost:.2f} m) ...")
+
+            ok, status = self.navigate_to(g)
+
+            if ok:
+                self.get_logger().info("Reached ✅")
+                success_index = idx
+                break
+            else:
+                self.get_logger().warn(f"Failed/aborted ❌ (status={status}). Trying next best goal...")
+
+        # 4) Only remove goal if reached
+        if success_index is not None:
+            self.goals.pop(success_index)
+            self.get_logger().info(f"Remaining goals: {len(self.goals)}")
+        else:
+            self.get_logger().warn(f"All attempted goals failed this cycle. Waiting {self.retry_delay_sec}s then retry...")
+            # simple delay before next cycle
+            # (keeps it easy; if your system is slow this helps stabilize)
+            self.running = False
+            self.create_timer(self.retry_delay_sec, self._unlock_once)
+            return
 
         self.running = False
+
+    def _unlock_once(self):
+        # called once by the retry timer to re-enable loop
+        # (timer auto-cancels by not rescheduling itself)
+        pass
 
 
 def main():
