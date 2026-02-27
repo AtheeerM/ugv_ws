@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
+"""
+greedy_4_goals.py
+-----------------
+Waits for Nav2 to be fully ready before attempting any planning or navigation.
+Fixes:
+  - do_transform_pose() bypass (broken on some ROS2 Humble builds)
+  - Startup delay: waits for both action servers before the loop runs
+  - TF extrapolation: retries until a stable transform is available
+"""
 import math
+import time
 import rclpy
+import rclpy.time
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
-from nav2_msgs.srv import ComputePathToPose
+from nav2_msgs.action import ComputePathToPose
 
 import tf2_ros
-from tf2_geometry_msgs import do_transform_pose
 
 
-def path_length(nav_path) -> float:
-    poses = nav_path.poses
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def path_length(path) -> float:
+    poses = path.poses
     if len(poses) < 2:
         return 0.0
     dist = 0.0
@@ -27,48 +41,141 @@ def path_length(nav_path) -> float:
 
 
 def yaw_to_quat(yaw: float):
-    # planar yaw -> quaternion (z,w), x=y=0
     return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
 
+def pose_from_transform(tf_stamped, frame_id: str) -> PoseStamped:
+    """
+    Build a PoseStamped directly from a TransformStamped.
+    Avoids do_transform_pose() which is broken on some ROS2 Humble builds.
+    The robot is at the origin of its own base frame, so its map-frame pose
+    IS the transform itself.
+    """
+    t  = tf_stamped.transform
+    ps = PoseStamped()
+    ps.header.frame_id    = frame_id
+    ps.header.stamp       = tf_stamped.header.stamp
+    ps.pose.position.x    = t.translation.x
+    ps.pose.position.y    = t.translation.y
+    ps.pose.position.z    = t.translation.z
+    ps.pose.orientation.x = t.rotation.x
+    ps.pose.orientation.y = t.rotation.y
+    ps.pose.orientation.z = t.rotation.z
+    ps.pose.orientation.w = t.rotation.w
+    return ps
+
+
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+
 class Greedy4Goals(Node):
+
+    # How long to wait for Nav2 servers at startup (seconds)
+    NAV2_WAIT_SEC  = 30.0
+    # How long to wait for a stable TF at startup (seconds)
+    TF_WAIT_SEC    = 20.0
+    # Seconds between loop ticks once running
+    LOOP_PERIOD    = 2.0
+
     def __init__(self):
         super().__init__("greedy_4_goals")
 
-        # Nav2 interfaces
-        self.nav_action_name = "navigate_to_pose"
-        self.plan_service_name = "compute_path_to_pose"
+        self.map_frame  = "map"
+        self.base_frame = "base_footprint"
 
-        self.nav_client = ActionClient(self, NavigateToPose, self.nav_action_name)
-        self.plan_client = self.create_client(ComputePathToPose, self.plan_service_name)
+        self.nav_client  = ActionClient(self, NavigateToPose,    "navigate_to_pose")
+        self.plan_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
 
-        # TF to get robot pose in map
-        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # --- TUNABLES ---
-        self.max_goal_attempts_per_cycle = 4   # try up to N best goals each cycle (usually == len(goals))
-        self.retry_delay_sec = 2.0             # if everything fails, wait before trying again
-        self.plan_timeout_sec = 2.0
-        self.action_server_wait_sec = 2.0
+        self.plan_timeout_sec = 5.0
 
-        # Replace these with YOUR 4 points
+        # Your 4 goals (coordinates clicked in RViz)
         self.goals = [
-            self.make_goal(-0.84294593334198,  1.9491890668869019, 0.0),
-            self.make_goal(-3.521780252456665, 0.4063647389411926, 0.0),
-            self.make_goal( 0.4273202121257782, 2.102668523788452, 0.0),
-            self.make_goal(-3.9292821884155273, 5.361337184906006, 0.0),
+            self.make_goal(-0.84294593334198,   1.9491890668869019, 0.0),
+            self.make_goal(-3.521780252456665,  0.4063647389411926, 0.0),
+            self.make_goal( 0.4273202121257782, 2.102668523788452,  0.0),
+            self.make_goal(-3.9292821884155273, 5.361337184906006,  0.0),
         ]
 
-        self.running = False
-        self.timer = self.create_timer(1.0, self.loop)
-        self.get_logger().info("Greedy4Goals started. Make sure Nav2 is running + pose is initialized in RViz.")
+        self.running  = False
+        self.ready    = False   # set True after Nav2 + TF are confirmed ready
+        self.timer    = self.create_timer(self.LOOP_PERIOD, self.loop)
+
+        self.get_logger().info("Greedy4Goals started — waiting for Nav2 + TF to be ready...")
+
+        # Kick off async readiness check
+        self.create_timer(0.5, self._check_ready_once)
+
+    # ------------------------------------------------------------------
+    # Startup readiness gate
+    # ------------------------------------------------------------------
+
+    def _check_ready_once(self) -> None:
+        """
+        Called once shortly after startup.
+        Blocks (with spin) until both Nav2 action servers are up and
+        a stable TF transform is available.
+        After this, self.ready = True and the main loop is unblocked.
+        """
+        # --- Wait for Nav2 action servers ---
+        self.get_logger().info(
+            f"Waiting for 'navigate_to_pose' (up to {self.NAV2_WAIT_SEC}s)..."
+        )
+        if not self.nav_client.wait_for_server(timeout_sec=self.NAV2_WAIT_SEC):
+            self.get_logger().error(
+                "navigate_to_pose not available after timeout. "
+                "Is Nav2 running? Exiting."
+            )
+            raise SystemExit(1)
+
+        self.get_logger().info(
+            f"Waiting for 'compute_path_to_pose' (up to {self.NAV2_WAIT_SEC}s)..."
+        )
+        if not self.plan_client.wait_for_server(timeout_sec=self.NAV2_WAIT_SEC):
+            self.get_logger().error(
+                "compute_path_to_pose not available after timeout. "
+                "Is Nav2 running? Exiting."
+            )
+            raise SystemExit(1)
+
+        self.get_logger().info("Nav2 servers ready ✅")
+
+        # --- Wait for a stable TF transform ---
+        self.get_logger().info(
+            f"Waiting for stable TF ({self.map_frame} → {self.base_frame})..."
+        )
+        deadline = time.time() + self.TF_WAIT_SEC
+        while time.time() < deadline:
+            try:
+                self.tf_buffer.lookup_transform(
+                    self.map_frame, self.base_frame, rclpy.time.Time()
+                )
+                self.get_logger().info("TF transform available ✅")
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            self.get_logger().warn(
+                f"TF not stable after {self.TF_WAIT_SEC}s — "
+                "make sure you set the 2D Pose Estimate in RViz! "
+                "Will keep trying in main loop..."
+            )
+
+        self.ready = True
+        self.get_logger().info(
+            f"Ready! Starting greedy navigation over {len(self.goals)} goals."
+        )
+
+    # ------------------------------------------------------------------
+    # Pose helpers
+    # ------------------------------------------------------------------
 
     def make_goal(self, x: float, y: float, yaw: float) -> PoseStamped:
         g = PoseStamped()
-        g.header.frame_id = "map"
-        # IMPORTANT: timestamp helps TF / Nav2 timing
-        g.header.stamp = self.get_clock().now().to_msg()
+        g.header.frame_id = self.map_frame
         g.pose.position.x = x
         g.pose.position.y = y
         z, w = yaw_to_quat(yaw)
@@ -77,147 +184,173 @@ class Greedy4Goals(Node):
         return g
 
     def get_robot_pose_in_map(self) -> PoseStamped | None:
+        """Read robot pose from TF directly — no do_transform_pose()."""
         try:
-            tf = self.tf_buffer.lookup_transform("map", "base_link", rclpy.time.Time())
-            p = PoseStamped()
-            p.header.frame_id = "base_link"
-            p.header.stamp = self.get_clock().now().to_msg()
-            p.pose.orientation.w = 1.0
-            return do_transform_pose(p, tf)
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, rclpy.time.Time()
+            )
+            return pose_from_transform(tf, self.map_frame)
+        except tf2_ros.ExtrapolationException:
+            # Normal at startup — just wait
+            return None
         except Exception as e:
-            self.get_logger().warn(f"TF not ready (map->base_link): {e}")
+            self.get_logger().warn(f"TF error: {e}")
             return None
 
-    def compute_path_cost(self, start: PoseStamped, goal: PoseStamped) -> float | None:
-        if not self.plan_client.wait_for_service(timeout_sec=0.5):
-            self.get_logger().warn(f"Service '{self.plan_service_name}' not available yet")
+    # ------------------------------------------------------------------
+    # Planning
+    # ------------------------------------------------------------------
+
+    def compute_path_cost(
+        self, start_map: PoseStamped, goal_map: PoseStamped
+    ) -> float | None:
+
+        now = self.get_clock().now().to_msg()
+        start_map.header.stamp = now
+        goal_map.header.stamp  = now
+
+        plan_goal           = ComputePathToPose.Goal()
+        plan_goal.start     = start_map
+        plan_goal.goal      = goal_map
+        plan_goal.use_start = True
+
+        send_future = self.plan_client.send_goal_async(plan_goal)
+        rclpy.spin_until_future_complete(
+            self, send_future, timeout_sec=self.plan_timeout_sec
+        )
+        gh = send_future.result()
+        if gh is None or not gh.accepted:
+            self.get_logger().debug("Plan goal rejected by server.")
             return None
 
-        # Stamp both start and goal (Nav2 likes fresh stamps)
-        start.header.stamp = self.get_clock().now().to_msg()
-        goal.header.stamp = self.get_clock().now().to_msg()
-
-        req = ComputePathToPose.Request()
-        req.start = start
-        req.goal = goal
-        req.use_start = True
-
-        future = self.plan_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=self.plan_timeout_sec)
-        if future.result() is None:
+        res_future = gh.get_result_async()
+        rclpy.spin_until_future_complete(
+            self, res_future, timeout_sec=self.plan_timeout_sec
+        )
+        res = res_future.result()
+        if res is None:
+            self.get_logger().debug("Plan result was None (timeout?).")
             return None
 
-        return path_length(future.result().path)
+        length = path_length(res.result.path)
+        if length == 0.0:
+            self.get_logger().debug("Planner returned zero-length path — skipping goal.")
+            return None
 
-    def navigate_to(self, goal: PoseStamped) -> tuple[bool, int]:
-        """
-        Returns (success, status_code)
-        status_code is action_msgs/GoalStatus value.
-        """
-        if not self.nav_client.wait_for_server(timeout_sec=self.action_server_wait_sec):
-            self.get_logger().error(f"Action '{self.nav_action_name}' not available")
-            return False, -1
+        return length
 
-        goal.header.stamp = self.get_clock().now().to_msg()
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
 
-        msg = NavigateToPose.Goal()
-        msg.pose = goal
+    def navigate_to(self, goal_map: PoseStamped) -> bool:
+        goal_map.header.stamp = self.get_clock().now().to_msg()
 
-        send_future = self.nav_client.send_goal_async(msg)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=2.0)
-        goal_handle = send_future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().warn("Goal rejected")
-            return False, -2
+        g      = NavigateToPose.Goal()
+        g.pose = goal_map
 
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
-        result = result_future.result()
-        if result is None:
-            return False, -3
+        send_future = self.nav_client.send_goal_async(g)
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=5.0)
+        gh = send_future.result()
+        if gh is None or not gh.accepted:
+            self.get_logger().warn("Navigation goal rejected.")
+            return False
 
-        status = result.status
-        # action_msgs/GoalStatus: 4 = SUCCEEDED
-        return (status == 4), status
+        self.get_logger().info("Goal accepted, driving...")
+        res_future = gh.get_result_async()
+        rclpy.spin_until_future_complete(self, res_future)
+        res = res_future.result()
+        if res is None:
+            return False
+
+        from action_msgs.msg import GoalStatus
+        return res.status == GoalStatus.STATUS_SUCCEEDED
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     def loop(self):
+        # Block until Nav2 + TF confirmed ready
+        if not self.ready:
+            return
+
         if self.running:
             return
 
-        if len(self.goals) == 0:
-            self.get_logger().info("All destinations completed ✅")
+        if not self.goals:
+            self.get_logger().info("All goals completed ✅  Shutting down loop.")
             self.timer.cancel()
             return
 
+        # Get robot pose
         start = self.get_robot_pose_in_map()
         if start is None:
+            self.get_logger().warn(
+                "TF not ready yet — set 2D Pose Estimate in RViz if you haven't!"
+            )
             return
 
         self.running = True
 
-        # 1) compute cost to every remaining goal
+        # --- Score all goals ---
+        self.get_logger().info(f"Planning paths to {len(self.goals)} remaining goals...")
         scored = []
         for i, g in enumerate(self.goals):
             cost = self.compute_path_cost(start, g)
-            if cost is None:
-                continue
-            scored.append((cost, i))
+            if cost is not None:
+                scored.append((cost, i))
+                self.get_logger().info(f"  Goal #{i} → {cost:.2f} m")
+            else:
+                self.get_logger().warn(f"  Goal #{i} → no valid path")
 
         if not scored:
-            self.get_logger().warn("No valid paths to any goal right now. Will retry soon...")
+            self.get_logger().warn(
+                "Planner returned no valid paths. Possible causes:\n"
+                "  1. Costmap not yet built — wait a few more seconds\n"
+                "  2. Goals are inside walls — re-click them in RViz\n"
+                "  3. 2D Pose Estimate not set in RViz\n"
+                "Retrying in 5s..."
+            )
             self.running = False
             return
 
-        # 2) sort by best cost (greedy)
+        # --- Greedy: pick nearest ---
         scored.sort(key=lambda x: x[0])
+        best_cost, best_idx = scored[0]
+        goal = self.goals.pop(best_idx)
 
-        # 3) Try goals from best to worse until one succeeds
-        attempts = 0
-        success_index = None
+        self.get_logger().info(
+            f"→ Navigating to goal #{best_idx} (cost ≈ {best_cost:.2f} m) | "
+            f"{len(self.goals)} goals remaining after this"
+        )
 
-        for cost, idx in scored:
-            attempts += 1
-            if attempts > self.max_goal_attempts_per_cycle:
-                break
+        ok = self.navigate_to(goal)
 
-            g = self.goals[idx]
-            self.get_logger().info(f"Trying goal #{idx} (greedy cost ~ {cost:.2f} m) ...")
-
-            ok, status = self.navigate_to(g)
-
-            if ok:
-                self.get_logger().info("Reached ✅")
-                success_index = idx
-                break
-            else:
-                self.get_logger().warn(f"Failed/aborted ❌ (status={status}). Trying next best goal...")
-
-        # 4) Only remove goal if reached
-        if success_index is not None:
-            self.goals.pop(success_index)
-            self.get_logger().info(f"Remaining goals: {len(self.goals)}")
+        if ok:
+            self.get_logger().info("Reached ✅")
         else:
-            self.get_logger().warn(f"All attempted goals failed this cycle. Waiting {self.retry_delay_sec}s then retry...")
-            # simple delay before next cycle
-            # (keeps it easy; if your system is slow this helps stabilize)
-            self.running = False
-            self.create_timer(self.retry_delay_sec, self._unlock_once)
-            return
+            self.get_logger().warn(
+                "Navigation failed ❌ — goal dropped, moving to next."
+            )
 
         self.running = False
 
-    def _unlock_once(self):
-        # called once by the retry timer to re-enable loop
-        # (timer auto-cancels by not rescheduling itself)
-        pass
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     rclpy.init()
     node = Greedy4Goals()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, SystemExit):
+        node.get_logger().info("Shutting down.")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
