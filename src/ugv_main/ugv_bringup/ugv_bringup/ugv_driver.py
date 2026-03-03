@@ -51,7 +51,7 @@ class UgvDriver(Node):
                 angular_velocity = -0.2
 
         # Send the velocity data to the UGV as a JSON string
-        data = json.dumps({'T': '13', 'X': linear_velocity, 'Z': angular_velocity}) + "\n"
+        data = json.dumps({'T': 13, 'X': linear_velocity, 'Z': angular_velocity}) + "\n"
         ser.write(data.encode())
 
     # Callback for processing joint state updates
