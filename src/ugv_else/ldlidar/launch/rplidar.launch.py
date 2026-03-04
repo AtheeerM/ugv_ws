@@ -47,10 +47,17 @@ def generate_launch_description():
     arguments=['0','0','0','0','0','0','base_footprint','base_lidar_link']
   )
 
+  laser_tf_node = Node(
+    package='tf2_ros',
+    executable='static_transform_publisher',
+    name='base_lidar_to_laser',
+    arguments=['0','0','0','0','0','0','base_lidar_link','laser'])
+  
+
   # Define LaunchDescription variable (keep SAME)
   rp = LaunchDescription()
 
   rp.add_action(rplidar_node)
-  rp.add_action(base_footprint_to_laser_tf_node)
+  rp.add_action(laser_tf_node)
 
   return rp
