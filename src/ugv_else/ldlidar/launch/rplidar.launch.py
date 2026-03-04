@@ -29,7 +29,7 @@ def generate_launch_description():
       name='rplidar',               
       output='screen',
       parameters=[
-        {'frame_id': 'laser'},     # keep SAME as your template
+        {'frame_id': 'base_lidar_link'},     # keep SAME as your template
         {'serial_port': '/dev/ttyUSB0'},     # keep SAME port path as your template
         {'serial_baudrate': 115200},         # keep SAME baudrate as your template
 
