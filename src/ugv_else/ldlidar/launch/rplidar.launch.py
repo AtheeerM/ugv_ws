@@ -29,9 +29,9 @@ def generate_launch_description():
       name='rplidar',               
       output='screen',
       parameters=[
-        {'frame_id': 'base_lidar_link'},     # keep SAME as your template
-        {'serial_port': '/dev/ttyACM0'},     # keep SAME port path as your template
-        {'serial_baudrate': 230400},         # keep SAME baudrate as your template
+        {'frame_id': 'laser'},     # keep SAME as your template
+        {'serial_port': '/dev/ttyUSB0'},     # keep SAME port path as your template
+        {'serial_baudrate': 115200},         # keep SAME baudrate as your template
 
         # "ranges and specifications" (your rplidar launch settings)
         {'angle_compensate': True},
@@ -51,6 +51,6 @@ def generate_launch_description():
   rp = LaunchDescription()
 
   rp.add_action(rplidar_node)
-  # ld.add_action(base_footprint_to_laser_tf_node)
+  rp.add_action(base_footprint_to_laser_tf_node)
 
   return rp
