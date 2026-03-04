@@ -43,8 +43,8 @@ class Greedy4Goals(Node):
         ]
         self.get_logger().info("Waiting for Nav2 action server...")
         self.nav_client.wait_for_server()
-        self.get_logger().info("Nav2 ready! Waiting 5s for full initialization...")
-        time.sleep(5.0)
+        self.get_logger().info("Nav2 ready! Waiting 15s for full initialization...")
+        time.sleep(15.0)
         self.get_logger().info("Starting greedy navigation!")
         self._nav_thread = threading.Thread(target=self.navigation_loop, daemon=True)
         self._nav_thread.start()
@@ -70,18 +70,24 @@ class Greedy4Goals(Node):
         return math.hypot(pose.pose.position.x - goal.pose.position.x, pose.pose.position.y - goal.pose.position.y)
 
     def clear_costmaps(self):
-        self.get_logger().info(">>> Clearing costmaps...")
-        for svc in ["/local_costmap/clear_entirely_local_costmap"]:
-            try:
-                result = subprocess.run(["ros2", "service", "call", svc, "nav2_msgs/srv/ClearEntireCostmap", "{}"], timeout=20, capture_output=True, text=True)
-                if result.returncode == 0:
-                    self.get_logger().info(f"    Cleared: {svc}")
-                else:
-                    self.get_logger().warn(f"    Failed: {result.stderr[:80]}")
-            except Exception as e:
-                self.get_logger().warn(f"    Error: {e}")
-        self.get_logger().info(">>> Done clearing. Waiting 5s to settle...")
-        time.sleep(5.0)
+        self.get_logger().info(">>> Clearing local costmap...")
+        try:
+            result = subprocess.run(
+                ["ros2", "service", "call",
+                 "/local_costmap/clear_entirely_local_costmap",
+                 "nav2_msgs/srv/ClearEntireCostmap", "{}"],
+                timeout=5,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                self.get_logger().info("    Local costmap cleared.")
+            else:
+                self.get_logger().warn("    Clear failed (continuing anyway).")
+        except Exception:
+            self.get_logger().warn("    Clear timed out (continuing anyway).")
+        self.get_logger().info(">>> Waiting 3s to settle...")
+        time.sleep(3.0)
 
     def send_goal_once(self, goal):
         goal.header.stamp = self.get_clock().now().to_msg()
@@ -124,7 +130,7 @@ class Greedy4Goals(Node):
                 self.get_logger().info(f"Goal SUCCEEDED on attempt {attempt}!")
                 return True
             elif result == 'rejected':
-                self.get_logger().warn(f"Goal REJECTED (attempt {attempt}). Clearing costmaps and retrying...")
+                self.get_logger().warn(f"Goal REJECTED (attempt {attempt}). Clearing and retrying...")
                 self.clear_costmaps()
             elif result == 'failed':
                 self.get_logger().warn(f"Navigation FAILED mid-route (attempt {attempt}). Clearing and retrying...")
@@ -162,8 +168,8 @@ class Greedy4Goals(Node):
                 robot_after = self.get_robot_pose()
                 pos = f"({robot_after.pose.position.x:.2f},{robot_after.pose.position.y:.2f})" if robot_after else "unknown"
                 self.get_logger().info(f"GOAL {goal_num} REACHED! Robot now at {pos}. {len(self.goals)} goals left.")
-                self.get_logger().info("Waiting 10s for Nav2 to reset...")
-                time.sleep(10.0)
+                self.get_logger().info("Waiting 5s for Nav2 to reset...")
+                time.sleep(5.0)
                 self.clear_costmaps()
             else:
                 self.get_logger().warn("Requeueing failed goal.")
