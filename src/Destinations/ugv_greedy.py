@@ -8,6 +8,8 @@ from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose, ComputePathToPose
 from action_msgs.msg import GoalStatus
 import tf2_ros
+import signal
+import sys
 
 
 def yaw_to_quat(yaw):
@@ -38,7 +40,8 @@ class Greedy4Goals(Node):
         self.map_frame  = "map"
         self.base_frame = "base_footprint"
         self.cb_group = ReentrantCallbackGroup()
-
+        self._shutdown = False          # ADD: shutdown flag
+        self._current_gh = None         # ADD: track active goal handle
         self.nav_client  = ActionClient(self, NavigateToPose,    "navigate_to_pose",    callback_group=self.cb_group)
         self.plan_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose", callback_group=self.cb_group)
 
@@ -72,9 +75,22 @@ class Greedy4Goals(Node):
     # ------------------------------------------------------------------
 
     def stop_robot(self):
-        # FIX: was creating publisher inside method (wrong indentation + bad practice)
-        self.cmd_vel_pub.publish(Twist())  # all zeros = stop
-        time.sleep(0.5)
+        self._shutdown = True
+        # Cancel active Nav2 goal so Nav2 stops sending velocity commands
+        if self._current_gh is not None:
+            try:
+                cancel_future = self._current_gh.cancel_goal_async()
+                # Give it 1 second to cancel
+                deadline = time.time() + 1.0
+                while not cancel_future.done() and time.time() < deadline:
+                    time.sleep(0.05)
+            except Exception:
+                pass
+            self._current_gh = None
+        # Now publish zero velocity directly
+        for _ in range(5):              # publish multiple times to be sure
+            self.cmd_vel_pub.publish(Twist())
+            time.sleep(0.05)
 
     # ------------------------------------------------------------------
     # Pose helpers
@@ -223,6 +239,8 @@ class Greedy4Goals(Node):
         gh = gh_box[0]
         if gh is None or not gh.accepted:
             return 'rejected'
+        
+        self._current_gh = gh 
 
         self.get_logger().info("Goal accepted! Driving...")
         rf = gh.get_result_async()
@@ -356,17 +374,20 @@ class Greedy4Goals(Node):
 def main():
     rclpy.init()
     node = Greedy4Goals()
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(node)
-    try:
-        executor.spin()
-    except (KeyboardInterrupt, SystemExit):
-        node.get_logger().info("Shutting down.")
-        node.stop_robot()
-    finally:
+
+    def shutdown_handler(sig, frame):
+        node.get_logger().info('Shutting down - stopping robot...')
+        node.stop_robot()               # cancels Nav2 goal + publishes zero vel
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    executor.spin()
 
 
 if __name__ == "__main__":
