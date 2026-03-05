@@ -64,6 +64,8 @@ class Greedy4Goals(Node):
 
         self._nav_thread = threading.Thread(target=self.navigation_loop, daemon=True)
         self._nav_thread.start()
+    
+    
 
     # ------------------------------------------------------------------
     # Stop robot immediately
@@ -119,7 +121,7 @@ class Greedy4Goals(Node):
     # Path planning
     # ------------------------------------------------------------------
 
-    def get_path_cost(self, start, goal):
+    def get_path_cost(self, start, goal,timeout=5.0):
         goal_msg = ComputePathToPose.Goal()
         goal_msg.start     = start
         goal_msg.goal      = goal
@@ -141,7 +143,7 @@ class Greedy4Goals(Node):
         sf = self.plan_client.send_goal_async(goal_msg)
         sf.add_done_callback(goal_cb)
 
-        if not send_event.wait(timeout=5.0):
+        if not send_event.wait(timeout=timeout):
             return None
         gh = gh_box[0]
         if gh is None or not gh.accepted:
@@ -150,7 +152,7 @@ class Greedy4Goals(Node):
         rf = gh.get_result_async()
         rf.add_done_callback(result_cb)
 
-        if not result_event.wait(timeout=5.0):
+        if not result_event.wait(timeout=timeout):
             return None
         res = res_box[0]
         if res is None:
@@ -236,7 +238,6 @@ class Greedy4Goals(Node):
     # ------------------------------------------------------------------
     # Navigate with mid-drive replan check
     # ------------------------------------------------------------------
-
     def navigate_with_replan(self, goal):
         """
         Drive to goal. If it fails, check if the goal is still reachable.
@@ -256,14 +257,28 @@ class Greedy4Goals(Node):
                 return True
 
             elif result == 'failed':
-                # Check if path to this goal still exists
                 robot = self.get_robot_pose()
                 if robot is not None:
-                    cost = self.get_path_cost(robot, goal)
-                    if cost is None:
-                        self.get_logger().warn("Goal unreachable — triggering full rescore of all goals")
-                        return False  # → navigation_loop will requeue + rescore
-                self.get_logger().warn(f"Navigation FAILED (attempt {attempt}), path still exists. Clearing and retrying...")
+                    current_cost = self.get_path_cost(robot, goal, timeout=1.0)
+
+                    # Completely unreachable
+                    if current_cost is None:
+                        self.get_logger().warn("Goal unreachable — triggering full rescore")
+                        return False
+
+                    # Check if any unvisited goal is now cheaper than current goal
+                    for other_goal in self.goals:
+                        other_cost = self.get_path_cost(robot, other_goal, timeout=1.0)
+                        if other_cost is not None and other_cost < current_cost:
+                            self.get_logger().warn(
+                                f"Goal ({other_goal.pose.position.x:.2f},{other_goal.pose.position.y:.2f}) "
+                                f"is now cheaper ({other_cost:.2f}m) than current ({current_cost:.2f}m) "
+                                f"— requeueing and rescoring all goals"
+                            )
+                            return False
+                    
+
+                self.get_logger().warn(f"FAILED (attempt {attempt}), retrying...")
                 self.clear_costmaps()
 
             elif result == 'rejected':
@@ -273,6 +288,7 @@ class Greedy4Goals(Node):
             elif result == 'timeout':
                 self.get_logger().warn(f"TIMEOUT (attempt {attempt}). Clearing and retrying...")
                 self.clear_costmaps()
+    
 
     # ------------------------------------------------------------------
     # Main navigation loop
