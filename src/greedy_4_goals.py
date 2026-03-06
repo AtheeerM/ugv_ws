@@ -41,6 +41,9 @@ class Greedy4Goals(Node):
             self.make_goal( 3.73,  6.49, 0.0),
             self.make_goal(-2.50,  3.50, 0.0),
         ]
+        # ✅ CHANGE 1: Save home position
+        self.home_pose = None
+
         self.get_logger().info("Waiting for Nav2 action server...")
         self.nav_client.wait_for_server()
         self.get_logger().info("Nav2 ready! Waiting 15s for full initialization...")
@@ -142,9 +145,16 @@ class Greedy4Goals(Node):
     def navigation_loop(self):
         self.get_logger().warn("Waiting for TF - set 2D Pose Estimate in RViz!")
         while rclpy.ok():
-            if self.get_robot_pose() is not None:
+            pose = self.get_robot_pose()
+            if pose is not None:
+                # ✅ CHANGE 2: Record home position when TF first available
+                self.home_pose = pose
+                self.get_logger().info(
+                    f"Home position saved: "
+                    f"({pose.pose.position.x:.2f},{pose.pose.position.y:.2f})")
                 break
             time.sleep(1.0)
+
         goal_num = 0
         while rclpy.ok() and self.goals:
             robot = self.get_robot_pose()
@@ -174,7 +184,21 @@ class Greedy4Goals(Node):
             else:
                 self.get_logger().warn("Requeueing failed goal.")
                 self.goals.append(goal)
+
+        # ✅ CHANGE 3: Return to home after all goals done
         self.get_logger().info("ALL GOALS COMPLETED!")
+        if self.home_pose is not None:
+            hx = self.home_pose.pose.position.x
+            hy = self.home_pose.pose.position.y
+            self.get_logger().info(f"Returning to home ({hx:.2f},{hy:.2f})...")
+            self.clear_costmaps()
+            ok = self.navigate_to(self.home_pose)
+            if ok:
+                self.get_logger().info("MISSION COMPLETE! Robot returned home!")
+            else:
+                self.get_logger().warn("Failed to return home.")
+        else:
+            self.get_logger().warn("Home position not saved - cannot return.")
 
 def main():
     rclpy.init()
