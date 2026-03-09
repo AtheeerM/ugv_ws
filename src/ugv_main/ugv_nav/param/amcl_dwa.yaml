@@ -63,7 +63,7 @@ bt_navigator:
     robot_base_frame: base_link
     odom_topic: /odom
     bt_loop_duration: 10
-    default_server_timeout: 10
+    default_server_timeout: 20
     enable_groot_monitoring: True
     groot_zmq_publisher_port: 1666
     groot_zmq_server_port: 1667
@@ -124,7 +124,7 @@ controller_server:
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.5
-      movement_time_allowance: 5.0
+      movement_time_allowance: 10.0
     # Goal checker parameters
     #precise_goal_checker:
     #  plugin: "nav2_controller::SimpleGoalChecker"
@@ -146,7 +146,7 @@ controller_server:
       rotate_to_heading_angular_vel: 1.2
       max_angular_accel: 2.0
       simulate_ahead_time: 1.0
-      debug_trajectory_details: True
+      debug_trajectory_details: False
       min_vel_x: 0.0
       min_vel_y: 0.0
       max_vel_x: 0.26
@@ -166,9 +166,9 @@ controller_server:
       vx_samples: 20
       vy_samples: 5
       vtheta_samples: 40
-      sim_time: 2.5
-      linear_granularity: 0.03
-      angular_granularity: 0.01
+      sim_time: 1.5
+      linear_granularity: 0.05
+      angular_granularity: 0.025
       transform_tolerance: 0.5
       xy_goal_tolerance: 0.25
       trans_stopped_velocity: 0.05
@@ -206,7 +206,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.25
+        inflation_radius: 0.3
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -260,7 +260,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.25
+        inflation_radius: 0.3
       always_send_full_costmap: True
 
 map_server:
@@ -278,7 +278,7 @@ map_saver:
 
 planner_server:
   ros__parameters:
-    expected_planner_frequency: 20.0
+    expected_planner_frequency: 3.0
     use_sim_time: False
     planner_plugins: ["GridBased"]
     GridBased:
