@@ -47,7 +47,7 @@ class Greedy4Goals(Node):
 
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
+        self.home_pose = None
         # FIX: Twist publisher must be created in __init__, not inside stop_robot
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 1)
 
@@ -67,6 +67,7 @@ class Greedy4Goals(Node):
 
         self._nav_thread = threading.Thread(target=self.navigation_loop, daemon=True)
         self._nav_thread.start()
+
     
     
 
@@ -256,7 +257,7 @@ class Greedy4Goals(Node):
     # ------------------------------------------------------------------
     # Navigate with mid-drive replan check
     # ------------------------------------------------------------------
-    def navigate_with_replan(self, goal):
+    def navigate_with_replan(self, goal,max_attempts=None):
         """
         Drive to goal. If it fails, check if the goal is still reachable.
         If unreachable → return False so navigation_loop can requeue + rescore.
@@ -265,6 +266,9 @@ class Greedy4Goals(Node):
         attempt = 0
         while True:
             attempt += 1
+            if max_attempts is not None and attempt > max_attempts:
+                self.get_logger().warn(f"Giving up after {max_attempts} attempts.")
+                return False
             self.get_logger().info(
                 f"Sending goal ({goal.pose.position.x:.2f},{goal.pose.position.y:.2f}) attempt {attempt}..."
             )
@@ -315,7 +319,13 @@ class Greedy4Goals(Node):
     def navigation_loop(self):
         self.get_logger().warn("Waiting for TF - set 2D Pose Estimate in RViz if needed!")
         while rclpy.ok():
-            if self.get_robot_pose() is not None:
+            pose = self.get_robot_pose()
+            if pose is not None:
+                # ✅ CHANGE 2: Record home position when TF first available
+                self.home_pose = pose
+                self.get_logger().info(
+                    f"Home position saved: "
+                    f"({pose.pose.position.x:.2f},{pose.pose.position.y:.2f})")
                 break
             time.sleep(1.0)
 
@@ -362,9 +372,22 @@ class Greedy4Goals(Node):
                 # Path was blocked mid-drive — requeue and rescore all goals next iteration
                 self.get_logger().warn("Path blocked mid-drive! Requeueing goal and rescoring all goals...")
                 self.goals.append(goal)
+                self.clear_costmaps()
                 # Loop continues → will rescore all goals including this one
 
         self.get_logger().info("ALL GOALS COMPLETED!")
+        if self.home_pose is not None:
+            hx = self.home_pose.pose.position.x
+            hy = self.home_pose.pose.position.y
+            self.get_logger().info(f"Returning to home ({hx:.2f},{hy:.2f})...")
+            self.clear_costmaps()
+            ok = self.navigate_with_replan(self.home_pose, max_attempts=5)
+            if ok:
+                self.get_logger().info("MISSION COMPLETE! Robot returned home!")
+            else:
+                self.get_logger().warn("Failed to return home.")
+        else:
+            self.get_logger().warn("Home position not saved - cannot return.")
 
 
 # ------------------------------------------------------------------
