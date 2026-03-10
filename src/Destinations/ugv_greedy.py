@@ -10,14 +10,15 @@ from action_msgs.msg import GoalStatus
 import tf2_ros
 import signal
 import sys
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
 
 # ------------------------------------------------------------------
-# Tuning constants — adjust these to control sensitivity
+# Tuning constants
 # ------------------------------------------------------------------
-CHECK_INTERVAL      = 8.0   # seconds between mid-drive checks
-MAX_RECOVERIES      = 3     # abort current goal after this many Nav2 recoveries
-CHEAPER_THRESHOLD   = 1 # switch if another goal costs < 80% of current goal path cost
+CHECK_INTERVAL    = 8.0  # seconds between mid-drive checks
+MAX_RECOVERIES    = 3    # abort current goal after this many Nav2 recoveries
+CHEAPER_THRESHOLD = 1.0  # switch if another goal has any lower path cost
 
 
 def yaw_to_quat(yaw):
@@ -41,17 +42,19 @@ def pose_from_tf(tf_stamped, frame_id):
 
 class Greedy4Goals(Node):
 
-    OBSTACLE_REPLAN_RADIUS = 2.0  # meters — use path cost only when goal is this close
+    OBSTACLE_REPLAN_RADIUS = 2.0
 
     def __init__(self):
         super().__init__("greedy_4_goals")
         self.map_frame  = "map"
         self.base_frame = "base_footprint"
         self.cb_group = ReentrantCallbackGroup()
-        self._shutdown      = False
-        self._current_gh    = None
-        self._recovery_count = 0        # counts Nav2 recovery behaviours mid-drive
+        self._shutdown       = False
+        self._current_gh     = None
+        self._recovery_count = 0
+        self._amcl_nudged    = False
 
+        self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.nav_client  = ActionClient(self, NavigateToPose,    "navigate_to_pose",    callback_group=self.cb_group)
         self.plan_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose", callback_group=self.cb_group)
 
@@ -124,7 +127,7 @@ class Greedy4Goals(Node):
         )
 
     # ------------------------------------------------------------------
-    # Goal scoring — euclidean for far goals, path cost for nearby ones
+    # Goal scoring
     # ------------------------------------------------------------------
 
     def score_goal(self, robot, goal):
@@ -132,8 +135,7 @@ class Greedy4Goals(Node):
         if dist < self.OBSTACLE_REPLAN_RADIUS:
             cost = self.get_path_cost(robot, goal)
             return cost if cost is not None else float('inf')
-        else:
-            return dist
+        return dist
 
     # ------------------------------------------------------------------
     # Path planning
@@ -188,7 +190,25 @@ class Greedy4Goals(Node):
         return dist
 
     # ------------------------------------------------------------------
-    # Costmap
+    # AMCL relocalization nudge
+    # ------------------------------------------------------------------
+
+    def trigger_amcl_relocalize(self):
+        pose = self.get_robot_pose()
+        if pose is None:
+            return
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = "map"
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose = pose.pose
+        msg.pose.covariance[0]  = 0.25  # x uncertainty
+        msg.pose.covariance[7]  = 0.25  # y uncertainty
+        msg.pose.covariance[35] = 0.1   # yaw uncertainty
+        self.initial_pose_pub.publish(msg)
+        self.get_logger().info("AMCL relocalization triggered")
+
+    # ------------------------------------------------------------------
+    # Costmap clear
     # ------------------------------------------------------------------
 
     def clear_costmaps(self):
@@ -198,9 +218,7 @@ class Greedy4Goals(Node):
                 ["ros2", "service", "call",
                  "/local_costmap/clear_entirely_local_costmap",
                  "nav2_msgs/srv/ClearEntireCostmap", "{}"],
-                timeout=5,
-                capture_output=True,
-                text=True
+                timeout=5, capture_output=True, text=True
             )
             if result.returncode == 0:
                 self.get_logger().info("    Local costmap cleared.")
@@ -212,7 +230,7 @@ class Greedy4Goals(Node):
         time.sleep(3.0)
 
     # ------------------------------------------------------------------
-    # Cancel the active Nav2 goal cleanly
+    # Cancel active Nav2 goal
     # ------------------------------------------------------------------
 
     def _cancel_current_goal(self, reason=""):
@@ -229,13 +247,10 @@ class Greedy4Goals(Node):
         self._current_gh = None
 
     # ------------------------------------------------------------------
-    # Send goal and return (goal_handle, result_event, result_box)
-    # immediately — does NOT block until completion
+    # Send goal asynchronously
     # ------------------------------------------------------------------
 
     def _send_goal_async(self, goal):
-        """Send a Nav2 goal and return control immediately.
-        Returns (gh, result_event, result_box) or None on failure."""
         goal.header.stamp = self.get_clock().now().to_msg()
         ng = NavigateToPose.Goal()
         ng.pose = goal
@@ -254,13 +269,11 @@ class Greedy4Goals(Node):
             result_event.set()
 
         def feedback_cb(feedback_msg):
-            # Nav2 increments number_of_recoveries each time it runs a recovery behaviour
             recoveries = feedback_msg.feedback.number_of_recoveries
             if recoveries > self._recovery_count:
                 self._recovery_count = recoveries
-                self.get_logger().warn(
-                    f"Nav2 recovery #{recoveries} triggered during navigation"
-                )
+                self._amcl_nudged = False  # new recovery = allow nudge again
+                self.get_logger().warn(f"Nav2 recovery #{recoveries} triggered")
 
         sf = self.nav_client.send_goal_async(ng, feedback_callback=feedback_cb)
         sf.add_done_callback(goal_cb)
@@ -273,7 +286,8 @@ class Greedy4Goals(Node):
             return None, None, None
 
         self._current_gh     = gh
-        self._recovery_count = 0   # reset counter for this new goal
+        self._recovery_count = 0
+        self._amcl_nudged    = False
 
         rf = gh.get_result_async()
         rf.add_done_callback(result_cb)
@@ -281,8 +295,7 @@ class Greedy4Goals(Node):
         return gh, result_event, res_box
 
     # ------------------------------------------------------------------
-    # Mid-drive check: should we abandon this goal?
-    # Returns: 'continue' | 'cheaper_found' | 'too_many_recoveries'
+    # Mid-drive check
     # ------------------------------------------------------------------
 
     def _mid_drive_check(self, current_goal):
@@ -290,39 +303,41 @@ class Greedy4Goals(Node):
         if robot is None:
             return 'continue'
 
-        # --- Trigger 1: Too many Nav2 recoveries ---
+        # Nudge AMCL on first recovery so localization corrects
+        # itself before the robot reaches the goal
+        if self._recovery_count >= 1 and not self._amcl_nudged:
+            self.trigger_amcl_relocalize()
+            self._amcl_nudged = True
+
+        # Trigger 1: Too many recoveries
         if self._recovery_count >= MAX_RECOVERIES:
             self.get_logger().warn(
-                f"Too many recoveries ({self._recovery_count} >= {MAX_RECOVERIES}) — switching goal"
+                f"Too many recoveries ({self._recovery_count}) — switching goal"
             )
             return 'too_many_recoveries'
 
-        # --- Trigger 2: Another goal is significantly cheaper ---
+        # Trigger 2: Another goal is cheaper
         current_cost = self.get_path_cost(robot, current_goal, timeout=3.0)
         if current_cost is None:
-            # Can't even plan to current goal — definitely switch
-            self.get_logger().warn("Current goal is unreachable — switching goal")
+            self.get_logger().warn("Current goal unreachable — switching")
             return 'cheaper_found'
 
         for other in self.goals:
             other_cost = self.get_path_cost(robot, other, timeout=3.0)
             if other_cost is not None and other_cost < current_cost * CHEAPER_THRESHOLD:
                 self.get_logger().warn(
-                    f"Cheaper goal found: ({other.pose.position.x:.2f},{other.pose.position.y:.2f}) "
-                    f"costs {other_cost:.2f}m vs current {current_cost:.2f}m "
-                    f"({CHEAPER_THRESHOLD*100:.0f}% threshold) — switching"
+                    f"Cheaper goal ({other.pose.position.x:.2f},{other.pose.position.y:.2f}) "
+                    f"costs {other_cost:.2f}m vs current {current_cost:.2f}m — switching"
                 )
                 return 'cheaper_found'
 
         return 'continue'
 
     # ------------------------------------------------------------------
-    # Drive to goal with mid-drive polling
-    # Returns: 'succeeded' | 'switch_goal' | 'failed'
+    # Drive with monitoring
     # ------------------------------------------------------------------
 
     def _drive_with_monitoring(self, goal):
-        """Send goal and poll every CHECK_INTERVAL seconds for early-exit triggers."""
         gh, result_event, res_box = self._send_goal_async(goal)
 
         if gh is None:
@@ -332,20 +347,18 @@ class Greedy4Goals(Node):
         self.get_logger().info("Goal accepted! Monitoring mid-drive...")
 
         while not result_event.wait(timeout=CHECK_INTERVAL):
-            # Nav2 hasn't finished yet — run mid-drive checks
             decision = self._mid_drive_check(goal)
             if decision != 'continue':
                 self._cancel_current_goal(reason=decision)
                 return 'switch_goal'
 
-        # Nav2 finished — read result
         res = res_box[0]
         if res is not None and res.status == GoalStatus.STATUS_SUCCEEDED:
             return 'succeeded'
         return 'failed'
 
     # ------------------------------------------------------------------
-    # Navigate with replan — outer retry loop
+    # Navigate with replan
     # ------------------------------------------------------------------
 
     def navigate_with_replan(self, goal, max_attempts=None):
@@ -367,24 +380,20 @@ class Greedy4Goals(Node):
                 return True
 
             elif result == 'switch_goal':
-                # Mid-drive trigger fired — caller should requeue and rescore
                 return False
 
             elif result == 'failed':
-                # Nav2 aborted — check if worth retrying
                 robot = self.get_robot_pose()
                 if robot is not None:
                     current_cost = self.get_path_cost(robot, goal, timeout=3.0)
                     if current_cost is None:
-                        self.get_logger().warn("Goal unreachable after failure — triggering rescore")
+                        self.get_logger().warn("Goal unreachable after failure — rescoring")
                         return False
 
                     for other in self.goals:
                         other_cost = self.get_path_cost(robot, other, timeout=3.0)
                         if other_cost is not None and other_cost < current_cost * CHEAPER_THRESHOLD:
-                            self.get_logger().warn(
-                                f"Cheaper goal after failure — triggering rescore"
-                            )
+                            self.get_logger().warn("Cheaper goal after failure — rescoring")
                             return False
 
                 self.get_logger().warn(f"Failed (attempt {attempt}), clearing and retrying...")
@@ -434,7 +443,6 @@ class Greedy4Goals(Node):
             )
 
             self.clear_costmaps()
-
             ok = self.navigate_with_replan(goal)
 
             if ok:
