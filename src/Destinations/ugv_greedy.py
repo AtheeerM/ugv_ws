@@ -17,7 +17,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 # Tuning constants
 # ------------------------------------------------------------------
 CHECK_INTERVAL    = 8.0  # seconds between mid-drive checks
-MAX_RECOVERIES    = 3    # abort current goal after this many Nav2 recoveries
+MAX_RECOVERIES    = 5    # abort current goal after this many Nav2 recoveries
 CHEAPER_THRESHOLD = 1.0  # switch if another goal has any lower path cost
 
 
