@@ -12,6 +12,14 @@ import signal
 import sys
 
 
+# ------------------------------------------------------------------
+# Tuning constants — adjust these to control sensitivity
+# ------------------------------------------------------------------
+CHECK_INTERVAL      = 8.0   # seconds between mid-drive checks
+MAX_RECOVERIES      = 3     # abort current goal after this many Nav2 recoveries
+CHEAPER_THRESHOLD   = 1 # switch if another goal costs < 80% of current goal path cost
+
+
 def yaw_to_quat(yaw):
     return math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
@@ -40,15 +48,16 @@ class Greedy4Goals(Node):
         self.map_frame  = "map"
         self.base_frame = "base_footprint"
         self.cb_group = ReentrantCallbackGroup()
-        self._shutdown = False          # ADD: shutdown flag
-        self._current_gh = None         # ADD: track active goal handle
+        self._shutdown      = False
+        self._current_gh    = None
+        self._recovery_count = 0        # counts Nav2 recovery behaviours mid-drive
+
         self.nav_client  = ActionClient(self, NavigateToPose,    "navigate_to_pose",    callback_group=self.cb_group)
         self.plan_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose", callback_group=self.cb_group)
 
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.home_pose = None
-        # FIX: Twist publisher must be created in __init__, not inside stop_robot
+        self.home_pose   = None
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 1)
 
         self.goals = [
@@ -68,28 +77,22 @@ class Greedy4Goals(Node):
         self._nav_thread = threading.Thread(target=self.navigation_loop, daemon=True)
         self._nav_thread.start()
 
-    
-    
-
     # ------------------------------------------------------------------
     # Stop robot immediately
     # ------------------------------------------------------------------
 
     def stop_robot(self):
         self._shutdown = True
-        # Cancel active Nav2 goal so Nav2 stops sending velocity commands
         if self._current_gh is not None:
             try:
                 cancel_future = self._current_gh.cancel_goal_async()
-                # Give it 1 second to cancel
                 deadline = time.time() + 1.0
                 while not cancel_future.done() and time.time() < deadline:
                     time.sleep(0.05)
             except Exception:
                 pass
             self._current_gh = None
-        # Now publish zero velocity directly
-        for _ in range(5):              # publish multiple times to be sure
+        for _ in range(5):
             self.cmd_vel_pub.publish(Twist())
             time.sleep(0.05)
 
@@ -127,18 +130,16 @@ class Greedy4Goals(Node):
     def score_goal(self, robot, goal):
         dist = self.euclidean(robot, goal)
         if dist < self.OBSTACLE_REPLAN_RADIUS:
-            # Close enough that obstacles matter — use real path cost
             cost = self.get_path_cost(robot, goal)
             return cost if cost is not None else float('inf')
         else:
-            # Far away — straight line is fine, obstacles irrelevant
             return dist
 
     # ------------------------------------------------------------------
     # Path planning
     # ------------------------------------------------------------------
 
-    def get_path_cost(self, start, goal,timeout=5.0):
+    def get_path_cost(self, start, goal, timeout=5.0):
         goal_msg = ComputePathToPose.Goal()
         goal_msg.start     = start
         goal_msg.goal      = goal
@@ -211,10 +212,30 @@ class Greedy4Goals(Node):
         time.sleep(3.0)
 
     # ------------------------------------------------------------------
-    # Send single navigation goal
+    # Cancel the active Nav2 goal cleanly
     # ------------------------------------------------------------------
 
-    def send_goal_once(self, goal):
+    def _cancel_current_goal(self, reason=""):
+        if self._current_gh is None:
+            return
+        self.get_logger().warn(f"Cancelling current goal: {reason}")
+        try:
+            cancel_future = self._current_gh.cancel_goal_async()
+            deadline = time.time() + 2.0
+            while not cancel_future.done() and time.time() < deadline:
+                time.sleep(0.05)
+        except Exception:
+            pass
+        self._current_gh = None
+
+    # ------------------------------------------------------------------
+    # Send goal and return (goal_handle, result_event, result_box)
+    # immediately — does NOT block until completion
+    # ------------------------------------------------------------------
+
+    def _send_goal_async(self, goal):
+        """Send a Nav2 goal and return control immediately.
+        Returns (gh, result_event, result_box) or None on failure."""
         goal.header.stamp = self.get_clock().now().to_msg()
         ng = NavigateToPose.Goal()
         ng.pose = goal
@@ -232,85 +253,142 @@ class Greedy4Goals(Node):
             res_box[0] = fut.result()
             result_event.set()
 
-        sf = self.nav_client.send_goal_async(ng)
+        def feedback_cb(feedback_msg):
+            # Nav2 increments number_of_recoveries each time it runs a recovery behaviour
+            recoveries = feedback_msg.feedback.number_of_recoveries
+            if recoveries > self._recovery_count:
+                self._recovery_count = recoveries
+                self.get_logger().warn(
+                    f"Nav2 recovery #{recoveries} triggered during navigation"
+                )
+
+        sf = self.nav_client.send_goal_async(ng, feedback_callback=feedback_cb)
         sf.add_done_callback(goal_cb)
 
         if not send_event.wait(timeout=15.0):
-            return 'timeout'
+            return None, None, None
+
         gh = gh_box[0]
         if gh is None or not gh.accepted:
-            return 'rejected'
-        
-        self._current_gh = gh 
+            return None, None, None
 
-        self.get_logger().info("Goal accepted! Driving...")
+        self._current_gh     = gh
+        self._recovery_count = 0   # reset counter for this new goal
+
         rf = gh.get_result_async()
         rf.add_done_callback(result_cb)
 
-        if not result_event.wait(timeout=180.0):
-            return 'timeout'
+        return gh, result_event, res_box
+
+    # ------------------------------------------------------------------
+    # Mid-drive check: should we abandon this goal?
+    # Returns: 'continue' | 'cheaper_found' | 'too_many_recoveries'
+    # ------------------------------------------------------------------
+
+    def _mid_drive_check(self, current_goal):
+        robot = self.get_robot_pose()
+        if robot is None:
+            return 'continue'
+
+        # --- Trigger 1: Too many Nav2 recoveries ---
+        if self._recovery_count >= MAX_RECOVERIES:
+            self.get_logger().warn(
+                f"Too many recoveries ({self._recovery_count} >= {MAX_RECOVERIES}) — switching goal"
+            )
+            return 'too_many_recoveries'
+
+        # --- Trigger 2: Another goal is significantly cheaper ---
+        current_cost = self.get_path_cost(robot, current_goal, timeout=3.0)
+        if current_cost is None:
+            # Can't even plan to current goal — definitely switch
+            self.get_logger().warn("Current goal is unreachable — switching goal")
+            return 'cheaper_found'
+
+        for other in self.goals:
+            other_cost = self.get_path_cost(robot, other, timeout=3.0)
+            if other_cost is not None and other_cost < current_cost * CHEAPER_THRESHOLD:
+                self.get_logger().warn(
+                    f"Cheaper goal found: ({other.pose.position.x:.2f},{other.pose.position.y:.2f}) "
+                    f"costs {other_cost:.2f}m vs current {current_cost:.2f}m "
+                    f"({CHEAPER_THRESHOLD*100:.0f}% threshold) — switching"
+                )
+                return 'cheaper_found'
+
+        return 'continue'
+
+    # ------------------------------------------------------------------
+    # Drive to goal with mid-drive polling
+    # Returns: 'succeeded' | 'switch_goal' | 'failed'
+    # ------------------------------------------------------------------
+
+    def _drive_with_monitoring(self, goal):
+        """Send goal and poll every CHECK_INTERVAL seconds for early-exit triggers."""
+        gh, result_event, res_box = self._send_goal_async(goal)
+
+        if gh is None:
+            self.get_logger().warn("Goal rejected or send timed out.")
+            return 'failed'
+
+        self.get_logger().info("Goal accepted! Monitoring mid-drive...")
+
+        while not result_event.wait(timeout=CHECK_INTERVAL):
+            # Nav2 hasn't finished yet — run mid-drive checks
+            decision = self._mid_drive_check(goal)
+            if decision != 'continue':
+                self._cancel_current_goal(reason=decision)
+                return 'switch_goal'
+
+        # Nav2 finished — read result
         res = res_box[0]
         if res is not None and res.status == GoalStatus.STATUS_SUCCEEDED:
             return 'succeeded'
         return 'failed'
 
     # ------------------------------------------------------------------
-    # Navigate with mid-drive replan check
+    # Navigate with replan — outer retry loop
     # ------------------------------------------------------------------
-    def navigate_with_replan(self, goal,max_attempts=None):
-        """
-        Drive to goal. If it fails, check if the goal is still reachable.
-        If unreachable → return False so navigation_loop can requeue + rescore.
-        If reachable but just failed → clear costmaps and retry.
-        """
+
+    def navigate_with_replan(self, goal, max_attempts=None):
         attempt = 0
         while True:
             attempt += 1
             if max_attempts is not None and attempt > max_attempts:
                 self.get_logger().warn(f"Giving up after {max_attempts} attempts.")
                 return False
+
             self.get_logger().info(
                 f"Sending goal ({goal.pose.position.x:.2f},{goal.pose.position.y:.2f}) attempt {attempt}..."
             )
-            result = self.send_goal_once(goal)
+
+            result = self._drive_with_monitoring(goal)
 
             if result == 'succeeded':
                 self.get_logger().info(f"Goal SUCCEEDED on attempt {attempt}!")
                 return True
 
+            elif result == 'switch_goal':
+                # Mid-drive trigger fired — caller should requeue and rescore
+                return False
+
             elif result == 'failed':
+                # Nav2 aborted — check if worth retrying
                 robot = self.get_robot_pose()
                 if robot is not None:
-                    current_cost = self.get_path_cost(robot, goal, timeout=1.0)
-
-                    # Completely unreachable
+                    current_cost = self.get_path_cost(robot, goal, timeout=3.0)
                     if current_cost is None:
-                        self.get_logger().warn("Goal unreachable — triggering full rescore")
+                        self.get_logger().warn("Goal unreachable after failure — triggering rescore")
                         return False
 
-                    # Check if any unvisited goal is now cheaper than current goal
-                    for other_goal in self.goals:
-                        other_cost = self.get_path_cost(robot, other_goal, timeout=1.0)
-                        if other_cost is not None and other_cost < current_cost:
+                    for other in self.goals:
+                        other_cost = self.get_path_cost(robot, other, timeout=3.0)
+                        if other_cost is not None and other_cost < current_cost * CHEAPER_THRESHOLD:
                             self.get_logger().warn(
-                                f"Goal ({other_goal.pose.position.x:.2f},{other_goal.pose.position.y:.2f}) "
-                                f"is now cheaper ({other_cost:.2f}m) than current ({current_cost:.2f}m) "
-                                f"— requeueing and rescoring all goals"
+                                f"Cheaper goal after failure — triggering rescore"
                             )
                             return False
-                    
 
-                self.get_logger().warn(f"FAILED (attempt {attempt}), retrying...")
+                self.get_logger().warn(f"Failed (attempt {attempt}), clearing and retrying...")
                 self.clear_costmaps()
-
-            elif result == 'rejected':
-                self.get_logger().warn(f"Goal REJECTED (attempt {attempt}). Clearing and retrying...")
-                self.clear_costmaps()
-
-            elif result == 'timeout':
-                self.get_logger().warn(f"TIMEOUT (attempt {attempt}). Clearing and retrying...")
-                self.clear_costmaps()
-    
 
     # ------------------------------------------------------------------
     # Main navigation loop
@@ -321,11 +399,10 @@ class Greedy4Goals(Node):
         while rclpy.ok():
             pose = self.get_robot_pose()
             if pose is not None:
-                # ✅ CHANGE 2: Record home position when TF first available
                 self.home_pose = pose
                 self.get_logger().info(
-                    f"Home position saved: "
-                    f"({pose.pose.position.x:.2f},{pose.pose.position.y:.2f})")
+                    f"Home position saved: ({pose.pose.position.x:.2f},{pose.pose.position.y:.2f})"
+                )
                 break
             time.sleep(1.0)
 
@@ -339,9 +416,10 @@ class Greedy4Goals(Node):
 
             rx, ry = robot.pose.position.x, robot.pose.position.y
             goal_num += 1
-            self.get_logger().info(f"===== GOAL {goal_num} | Robot at ({rx:.2f},{ry:.2f}) | {len(self.goals)} goals remaining =====")
+            self.get_logger().info(
+                f"===== GOAL {goal_num} | Robot at ({rx:.2f},{ry:.2f}) | {len(self.goals)} goals remaining ====="
+            )
 
-            # Score all goals — euclidean for far, path cost for nearby
             scored = [(self.score_goal(robot, g), i) for i, g in enumerate(self.goals)]
             scored.sort()
             for score, i in scored:
@@ -357,23 +435,20 @@ class Greedy4Goals(Node):
 
             self.clear_costmaps()
 
-            # FIX: was calling both navigate_to() AND navigate_with_replan() — duplicate navigation removed
-            # Now only navigate_with_replan() is used, which handles retries + replan check
             ok = self.navigate_with_replan(goal)
 
             if ok:
                 robot_after = self.get_robot_pose()
-                pos = f"({robot_after.pose.position.x:.2f},{robot_after.pose.position.y:.2f})" if robot_after else "unknown"
+                pos = (f"({robot_after.pose.position.x:.2f},{robot_after.pose.position.y:.2f})"
+                       if robot_after else "unknown")
                 self.get_logger().info(f"GOAL {goal_num} REACHED! Robot now at {pos}. {len(self.goals)} goals left.")
                 self.get_logger().info("Waiting 5s for Nav2 to reset...")
                 time.sleep(5.0)
                 self.clear_costmaps()
             else:
-                # Path was blocked mid-drive — requeue and rescore all goals next iteration
-                self.get_logger().warn("Path blocked mid-drive! Requeueing goal and rescoring all goals...")
+                self.get_logger().warn("Requeueing goal and rescoring all goals...")
                 self.goals.append(goal)
                 self.clear_costmaps()
-                # Loop continues → will rescore all goals including this one
 
         self.get_logger().info("ALL GOALS COMPLETED!")
         if self.home_pose is not None:
@@ -400,7 +475,7 @@ def main():
 
     def shutdown_handler(sig, frame):
         node.get_logger().info('Shutting down - stopping robot...')
-        node.stop_robot()               # cancels Nav2 goal + publishes zero vel
+        node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
         sys.exit(0)
