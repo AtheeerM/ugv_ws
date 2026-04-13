@@ -64,10 +64,10 @@ class Greedy4Goals(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 1)
 
         self.goals = [
-            self.make_goal(3.99,   0.0213,   0.00205),
-            self.make_goal(2.99,   0.984,    0.00026),
-            self.make_goal(0.991,  1.99,     0.00126),
-            self.make_goal(2.02,  -0.00146,  0.00243),
+            self.make_goal(2.89,   0.0335,   0.00442),
+            self.make_goal(2.92,   3.95,    0.00013),
+            self.make_goal(1.1,  3.01,     0.00149),
+            self.make_goal(0.998,  2,  0.0056),
         ]
 
         self.get_logger().info("Waiting for Nav2 action server...")
