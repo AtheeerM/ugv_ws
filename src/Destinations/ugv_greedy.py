@@ -67,7 +67,7 @@ class Greedy4Goals(Node):
             self.make_goal(2.89,   0.0335,   0.00442),
             self.make_goal(2.92,   3.95,    0.00013),
             self.make_goal(1.1,  3.01,     0.00149),
-            self.make_goal(0.998,  2,  0.0056),
+            self.make_goal(0.998,  2.0,  0.0056),
         ]
 
         self.get_logger().info("Waiting for Nav2 action server...")
