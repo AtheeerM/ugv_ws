@@ -724,11 +724,13 @@ class Greedy4Goals(Node):
                 f"Expecting: {expected_tag} | "
                 f"{len(self.goals)} remaining"
             )
+            # Reset LoRa state before approaching new goal
+            with self._lora_lock:
+                self._lora_tag_id = None
+                self._lora_rssi   = -999
 
             self.clear_costmaps()
-            ok, lora_confirmed = self.navigate_with_replan(   # ← unpack tuple
-                goal, goal_idx=original_idx)
-
+            ok, lora_confirmed = self.navigate_with_replan(goal, goal_idx=original_idx)
             if ok:
                 robot_after = self.get_robot_pose()
                 pos = (
