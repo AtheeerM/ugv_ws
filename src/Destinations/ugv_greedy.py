@@ -704,10 +704,10 @@ class Greedy4Goals(Node):
 
             # Resolve original index for TAG mapping
             goal_coords = [
-                (-2.50, 7.00),   # TAG_001
-                (-3.58, 0.56),   # TAG_002
-                ( 3.73, 6.49),   # TAG_003
-                (-2.50, 3.50),   # TAG_004
+                (2.92, 3.95),   # TAG_001
+                (1.1, 3.01),   # TAG_002
+                ( 0.998, 2.0),   # TAG_003
+                (2.89, 0.0335),   # TAG_004
             ]
             original_idx = None
             for orig_i, (x, y) in enumerate(goal_coords):
