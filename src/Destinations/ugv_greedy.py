@@ -583,188 +583,195 @@ class Greedy4Goals(Node):
     # ------------------------------------------------------------------
 
     def navigate_with_replan(self, goal, goal_idx=None, max_attempts=None):
-        attempt = 0
-        while True:
-            attempt += 1
-            if max_attempts is not None and attempt > max_attempts:
-                self.get_logger().warn(
-                    f"Giving up after {max_attempts} attempts.")
-                return False
+    attempt = 0
+    lora_confirmed = False  # ← track this
 
-            x = goal.pose.position.x
-            y = goal.pose.position.y
-            self.get_logger().info(
-                f"Sending goal ({x:.2f},{y:.2f}) attempt {attempt}...")
+    while True:
+        attempt += 1
+        if max_attempts is not None and attempt > max_attempts:
+            self.get_logger().warn(f"Giving up after {max_attempts} attempts.")
+            return False, False  # ← return tuple
 
-            result = self._drive_with_monitoring(goal)
+        x = goal.pose.position.x
+        y = goal.pose.position.y
+        self.get_logger().info(f"Sending goal ({x:.2f},{y:.2f}) attempt {attempt}...")
 
-            if result == 'succeeded':
-                self.get_logger().info(
-                    f"Nav2 SUCCEEDED on attempt {attempt}!")
+        result = self._drive_with_monitoring(goal)
 
-                if goal_idx is not None:
-                    # Check raw RSSI before calling approach so we
-                    # can tell apart "no signal" from "had signal, creep failed"
-                    with self._lora_lock:
-                        pre_rssi = (
-                            self._lora_rssi
-                            if self._lora_tag_id == GOAL_TAG_MAP.get(goal_idx)
-                            else None
+        if result == 'succeeded':
+            self.get_logger().info(f"Nav2 SUCCEEDED on attempt {attempt}!")
+
+            if goal_idx is not None:
+                with self._lora_lock:
+                    pre_rssi = (
+                        self._lora_rssi
+                        if self._lora_tag_id == GOAL_TAG_MAP.get(goal_idx)
+                        else None
+                    )
+
+                if pre_rssi is None:
+                    # ── OUTCOME 1: Nav2 only ──────────────────────
+                    self.get_logger().info(
+                        f"[RESULT] Destination {goal_idx} ({GOAL_TAG_MAP.get(goal_idx)}) "
+                        f"reached by NAV2 COORDINATES ONLY — no LoRa signal detected."
+                    )
+                else:
+                    lora_confirmed = self._approach_via_lora(goal_idx)
+                    if lora_confirmed:
+                        # ── OUTCOME 2: LoRa guided ────────────────
+                        self.get_logger().info(
+                            f"[RESULT] Destination {goal_idx} ({GOAL_TAG_MAP.get(goal_idx)}) "
+                            f"reached and CONFIRMED via LoRa — "
+                            f"robot closed in using signal strength."
+                        )
+                    else:
+                        # ── Signal detected but couldn't confirm ──
+                        self.get_logger().warn(
+                            f"[RESULT] Destination {goal_idx} ({GOAL_TAG_MAP.get(goal_idx)}) "
+                            f"LoRa signal was detected but could not reach threshold — "
+                            f"marked done by Nav2 coordinates."
                         )
 
-                    if pre_rssi is None:
-                        # No signal at all — skip creep entirely
-                        self.get_logger().warn(
-                            f"[LoRa] No signal from "
-                            f"{GOAL_TAG_MAP.get(goal_idx)} — "
-                            f"reached destination {goal_idx} via Nav2 only.")
-                    else:
-                        # Signal exists — run approach (creep if needed)
-                        confirmed = self._approach_via_lora(goal_idx)
-                        if confirmed:
-                            self.get_logger().info(
-                                f"[LoRa] Destination {goal_idx} "
-                                f"confirmed via LoRa tag.")
-                        else:
-                            self.get_logger().warn(
-                                f"[LoRa] Signal was detected but could not "
-                                f"reach threshold — "
-                                f"destination {goal_idx} marked done via Nav2.")
-                # Either way, Nav2 succeeded — move on
-                return True
+            return True, lora_confirmed  # ← return tuple
 
-            elif result == 'switch_goal':
-                return False
+        elif result == 'switch_goal':
+            return False, False
 
-            elif result == 'failed':
-                robot = self.get_robot_pose()
-                if robot is not None:
-                    current_cost = self.get_path_cost(
-                        robot, goal, timeout=3.0)
-                    if current_cost is None:
-                        return False
-                    for other in self.goals:
-                        other_cost = self.get_path_cost(
-                            robot, other, timeout=3.0)
-                        if (other_cost is not None and
-                                other_cost < current_cost * CHEAPER_THRESHOLD):
-                            return False
+        elif result == 'failed':
+            robot = self.get_robot_pose()
+            if robot is not None:
+                current_cost = self.get_path_cost(robot, goal, timeout=3.0)
+                if current_cost is None:
+                    return False, False
+                for other in self.goals:
+                    other_cost = self.get_path_cost(robot, other, timeout=3.0)
+                    if (other_cost is not None and
+                            other_cost < current_cost * CHEAPER_THRESHOLD):
+                        return False, False
 
-                self.get_logger().warn(
-                    f"Failed attempt {attempt}, retrying...")
-                self.clear_costmaps()
+            self.get_logger().warn(f"Failed attempt {attempt}, retrying...")
+            self.clear_costmaps()
 
     # ------------------------------------------------------------------
     # Main navigation loop
     # ------------------------------------------------------------------
 
     def navigation_loop(self):
-        self.get_logger().warn(
-            "Waiting for TF — set 2D Pose Estimate in RViz!")
-        while rclpy.ok():
-            pose = self.get_robot_pose()
-            if pose is not None:
-                self.home_pose = pose
-                self.get_logger().info(
-                    f"Home saved: "
-                    f"({pose.pose.position.x:.2f},"
-                    f"{pose.pose.position.y:.2f})"
-                )
-                break
+    self.get_logger().warn(
+        "Waiting for TF — set 2D Pose Estimate in RViz!")
+    while rclpy.ok():
+        pose = self.get_robot_pose()
+        if pose is not None:
+            self.home_pose = pose
+            self.get_logger().info(
+                f"Home saved: "
+                f"({pose.pose.position.x:.2f},"
+                f"{pose.pose.position.y:.2f})"
+            )
+            break
+        time.sleep(1.0)
+
+    goal_num = 0
+    while rclpy.ok() and self.goals:
+        robot = self.get_robot_pose()
+        if robot is None:
+            self.get_logger().warn("Lost TF, waiting...")
             time.sleep(1.0)
+            continue
 
-        goal_num = 0
-        while rclpy.ok() and self.goals:
-            robot = self.get_robot_pose()
-            if robot is None:
-                self.get_logger().warn("Lost TF, waiting...")
-                time.sleep(1.0)
-                continue
+        rx, ry = robot.pose.position.x, robot.pose.position.y
+        goal_num += 1
+        self.get_logger().info(
+            f"===== GOAL {goal_num} | "
+            f"Robot at ({rx:.2f},{ry:.2f}) | "
+            f"{len(self.goals)} remaining ====="
+        )
 
-            rx, ry = robot.pose.position.x, robot.pose.position.y
-            goal_num += 1
+        scored = [
+            (self.score_goal(robot, g), i)
+            for i, g in enumerate(self.goals)
+        ]
+        scored.sort()
+        for score, i in scored:
             self.get_logger().info(
-                f"===== GOAL {goal_num} | "
-                f"Robot at ({rx:.2f},{ry:.2f}) | "
-                f"{len(self.goals)} remaining ====="
+                f"  #{i} ({self.goals[i].pose.position.x:.2f},"
+                f"{self.goals[i].pose.position.y:.2f}) "
+                f"score={score:.2f}m"
             )
 
-            scored = [
-                (self.score_goal(robot, g), i)
-                for i, g in enumerate(self.goals)
-            ]
-            scored.sort()
-            for score, i in scored:
-                self.get_logger().info(
-                    f"  #{i} ({self.goals[i].pose.position.x:.2f},"
-                    f"{self.goals[i].pose.position.y:.2f}) "
-                    f"score={score:.2f}m"
-                )
+        best_score, best_idx = scored[0]
+        goal = self.goals.pop(best_idx)
 
-            best_score, best_idx = scored[0]
-            goal = self.goals.pop(best_idx)
+        # Resolve original index for TAG mapping
+        goal_coords = [
+            (-2.50, 7.00),   # TAG_001
+            (-3.58, 0.56),   # TAG_002
+            ( 3.73, 6.49),   # TAG_003
+            (-2.50, 3.50),   # TAG_004
+        ]
+        original_idx = None
+        for orig_i, (x, y) in enumerate(goal_coords):
+            if (abs(goal.pose.position.x - x) < 0.01 and
+                    abs(goal.pose.position.y - y) < 0.01):
+                original_idx = orig_i
+                break
 
-            # Resolve original index for TAG mapping
-            goal_coords = [
-                (-2.50, 7.00),   # TAG_001
-                (-3.58, 0.56),   # TAG_002
-                ( 3.73, 6.49),   # TAG_003
-                (-2.50, 3.50),   # TAG_004
-            ]
-            original_idx = None
-            for orig_i, (x, y) in enumerate(goal_coords):
-                if (abs(goal.pose.position.x - x) < 0.01 and
-                        abs(goal.pose.position.y - y) < 0.01):
-                    original_idx = orig_i
-                    break
+        expected_tag = GOAL_TAG_MAP.get(original_idx, "Unknown")
+        self.get_logger().info(
+            f"GREEDY PICK: "
+            f"({goal.pose.position.x:.2f},"
+            f"{goal.pose.position.y:.2f}) | "
+            f"Expecting: {expected_tag} | "
+            f"{len(self.goals)} remaining"
+        )
 
-            expected_tag = GOAL_TAG_MAP.get(original_idx, "Unknown")
-            self.get_logger().info(
-                f"GREEDY PICK: "
-                f"({goal.pose.position.x:.2f},"
-                f"{goal.pose.position.y:.2f}) | "
-                f"Expecting: {expected_tag} | "
-                f"{len(self.goals)} remaining"
+        self.clear_costmaps()
+        ok, lora_confirmed = self.navigate_with_replan(   # ← unpack tuple
+            goal, goal_idx=original_idx)
+
+        if ok:
+            robot_after = self.get_robot_pose()
+            pos = (
+                f"({robot_after.pose.position.x:.2f},"
+                f"{robot_after.pose.position.y:.2f})"
+                if robot_after else "unknown"
             )
-
-            self.clear_costmaps()
-            ok = self.navigate_with_replan(goal, goal_idx=original_idx)
-
-            if ok:
-                robot_after = self.get_robot_pose()
-                pos = (
-                    f"({robot_after.pose.position.x:.2f},"
-                    f"{robot_after.pose.position.y:.2f})"
-                    if robot_after else "unknown"
-                )
+            if lora_confirmed:
                 self.get_logger().info(
-                    f"GOAL {goal_num} CONFIRMED via LoRa! "
-                    f"Robot at {pos}. {len(self.goals)} left."
+                    f"===== GOAL {goal_num} COMPLETE | "
+                    f"LoRa guided approach — robot closed in on {expected_tag} | "
+                    f"Robot at {pos} | {len(self.goals)} left ====="
                 )
-                self.get_logger().info("Waiting 5s to reset...")
-                time.sleep(5.0)
-                self.clear_costmaps()
             else:
-                self.get_logger().warn("Requeueing goal...")
-                self.goals.append(goal)
-                self.clear_costmaps()
-
-        self.get_logger().info("ALL GOALS COMPLETED!")
-        if self.home_pose is not None:
-            hx = self.home_pose.pose.position.x
-            hy = self.home_pose.pose.position.y
-            self.get_logger().info(
-                f"Returning home ({hx:.2f},{hy:.2f})...")
-            self.clear_costmaps()
-            ok = self.navigate_with_replan(
-                self.home_pose, goal_idx=None, max_attempts=5)
-            if ok:
                 self.get_logger().info(
-                    "MISSION COMPLETE! Robot returned home!")
-            else:
-                self.get_logger().warn("Failed to return home.")
+                    f"===== GOAL {goal_num} COMPLETE | "
+                    f"Nav2 coordinates only — no LoRa signal from {expected_tag} | "
+                    f"Robot at {pos} | {len(self.goals)} left ====="
+                )
+            self.get_logger().info("Waiting 5s to reset...")
+            time.sleep(5.0)
+            self.clear_costmaps()
         else:
-            self.get_logger().warn("Home not saved — cannot return.")
+            self.get_logger().warn("Requeueing goal...")
+            self.goals.append(goal)
+            self.clear_costmaps()
+
+    self.get_logger().info("ALL GOALS COMPLETED!")
+    if self.home_pose is not None:
+        hx = self.home_pose.pose.position.x
+        hy = self.home_pose.pose.position.y
+        self.get_logger().info(
+            f"Returning home ({hx:.2f},{hy:.2f})...")
+        self.clear_costmaps()
+        ok, _ = self.navigate_with_replan(            # ← unpack tuple, ignore lora for home
+            self.home_pose, goal_idx=None, max_attempts=5)
+        if ok:
+            self.get_logger().info(
+                "MISSION COMPLETE! Robot returned home!")
+        else:
+            self.get_logger().warn("Failed to return home.")
+    else:
+        self.get_logger().warn("Home not saved — cannot return.")
 
 
 # ------------------------------------------------------------------
