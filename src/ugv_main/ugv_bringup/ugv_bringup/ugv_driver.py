@@ -102,11 +102,14 @@ class UgvDriver(Node):
     # Callback for processing voltage data
     def voltage_callback(self, msg):
         voltage_value = msg.data
-
-        # If voltage drops below a threshold, play a low battery warning sound
-        if 0.1 < voltage_value < 9: 
-            subprocess.run(['aplay', '-D', 'plughw:3,0', '/home/jaj/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/low_battery.wav'])
-            time.sleep(5)
+        if 0.1 < voltage_value < 9:
+            threading.Thread(
+                target=lambda: (
+                    subprocess.run(['aplay', '-D', 'plughw:3,0', 
+                        '/mnt/ssd/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/low_battery.wav']),
+                    time.sleep(5)
+                ), daemon=True
+            ).start()
 
 def main(args=None):
     rclpy.init(args=args)
