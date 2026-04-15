@@ -144,12 +144,10 @@ class Greedy4Goals(Node):
             with self._lora_lock:
                 self._lora_tag_id = tag_id
                 self._lora_rssi   = rssi
-            self.get_logger().info(
-                f"LoRa received: {tag_id} | "
-                f"RSSI: {rssi} dBm | {rssi_description(rssi)}"
-            )
+            # Remove or comment out this line:
+            # self.get_logger().info(f"LoRa received: ...")
         except Exception:
-            pass  # never crash navigation due to a bad LoRa packet
+            pass
 
     # ------------------------------------------------------------------
     # Stop robot immediately
