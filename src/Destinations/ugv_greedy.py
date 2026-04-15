@@ -134,10 +134,10 @@ class Greedy4Goals(Node):
 
         # ── Goals — TAG permanently tied to physical location ─────
         self.goals = [
-            self.make_goal(2.89,   0.0335,   0.00442),
-            self.make_goal(2.92,   3.95,    0.00013),
-            self.make_goal(1.1,  3.01,     0.00149),
-            self.make_goal(0.998,  2.0,  0.0056),
+            self.make_goal(3.1,   0.513,   0.00335),
+            self.make_goal(1.88,  -1.91,    0.00206),
+            self.make_goal(3.72,  -4.22,     0.00218),
+            self.make_goal(0.899,  -4.03,  0.00666),
         ]
 
         self.get_logger().info("Waiting for Nav2 action server...")
@@ -704,10 +704,10 @@ class Greedy4Goals(Node):
 
             # Resolve original index for TAG mapping
             goal_coords = [
-                (2.92, 3.95),   # TAG_001
-                (1.1, 3.01),   # TAG_002
-                ( 0.998, 2.0),   # TAG_003
-                (2.89, 0.0335),   # TAG_004
+                (3.1,   0.513),   # TAG_001
+                (1.88, -1.91),    # TAG_002
+                (3.72, -4.22),    # TAG_003
+                (0.899, -4.03),   # TAG_004
             ]
             original_idx = None
             for orig_i, (x, y) in enumerate(goal_coords):
