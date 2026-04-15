@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+import time
+import threading
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 import serial
-import threading
 
 
 class LoraReader(Node):
@@ -32,16 +34,21 @@ class LoraReader(Node):
     def read_serial(self):
         while rclpy.ok():
             try:
+                if not hasattr(self, 'serial_port'):
+                    time.sleep(0.1)
+                    continue
+
                 if self.serial_port.in_waiting > 0:
                     line = self.serial_port.readline()
-                    line = line.decode('utf-8').strip()
+                    line = line.decode('utf-8', errors='ignore').strip()
 
                     # Accept "TAG_001" or "TAG_001,-73"
                     if line.startswith("TAG_"):
                         parts  = line.split(',')
                         tag_id = parts[0].strip()
                         rssi   = parts[1].strip() \
-                            if len(parts) > 1 else "0"
+                            if len(parts) > 1 and parts[1].strip() \
+                            else "0"
 
                         if tag_id in ["TAG_001", "TAG_002",
                                       "TAG_003", "TAG_004"]:
@@ -52,8 +59,17 @@ class LoraReader(Node):
                             self.get_logger().info(
                                 f"Published: {msg.data}"
                             )
+                else:
+                    time.sleep(0.01)
+
             except Exception as e:
                 self.get_logger().warn(f"Serial error: {e}")
+
+    def destroy_node(self):
+        if hasattr(self, 'serial_port') and self.serial_port.is_open:
+            self.serial_port.close()
+            self.get_logger().info("Serial port closed.")
+        super().destroy_node()
 
 
 def main():
