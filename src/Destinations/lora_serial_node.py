@@ -20,9 +20,7 @@ class LoraReader(Node):
                 '/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0-port0',
                 115200, timeout=1.0
             )
-            self.get_logger().info(
-                "LoRa Reader started on /dev/ttyUSB2"
-            )
+            self.get_logger().info("LoRa Reader started successfully")
         except Exception as e:
             self.get_logger().error(f"Serial port error: {e}")
             return
