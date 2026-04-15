@@ -42,18 +42,19 @@ class LoraReader(Node):
                     line = self.serial_port.readline()
                     line = line.decode('utf-8', errors='ignore').strip()
 
-                    # Accept "TAG_001" or "TAG_001,-73"
-                    if line.startswith("TAG_"):
-                        parts  = line.split(',')
-                        tag_id = parts[0].strip()
-                        rssi   = parts[1].strip() \
-                            if len(parts) > 1 and parts[1].strip() \
-                            else "0"
+                    if "TAG_" in line:
+                        # Extract tag ID
+                        tag_start = line.index("TAG_")
+                        tag_id = line[tag_start:tag_start+7]  # e.g. "TAG_001"
+
+                        # Extract RSSI
+                        rssi = "0"
+                        if "RSSI:" in line:
+                            rssi = line.split("RSSI:")[-1].strip()  # e.g. "-70"
 
                         if tag_id in ["TAG_001", "TAG_002",
                                       "TAG_003", "TAG_004"]:
-                            # Publish as "TAG_001,-73"
-                            msg      = String()
+                            msg = String()
                             msg.data = f"{tag_id},{rssi}"
                             self.publisher.publish(msg)
                             self.get_logger().info(
