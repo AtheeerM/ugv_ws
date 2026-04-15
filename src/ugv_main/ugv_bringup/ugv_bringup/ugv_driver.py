@@ -9,6 +9,7 @@ from std_msgs.msg import Float32, Float32MultiArray
 import subprocess
 import time
 import os
+import threading
 
 def is_jetson():
     result = any("ugv_jetson" in root for root, dirs, files in os.walk("/"))
