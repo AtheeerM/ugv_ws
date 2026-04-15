@@ -7,68 +7,18 @@ from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose, ComputePathToPose
 from action_msgs.msg import GoalStatus
-from std_msgs.msg import String
 import tf2_ros
 import signal
 import sys
 from geometry_msgs.msg import PoseWithCovarianceStamped
 
-# ------------------------------------------------------------------
-# Tuning constants — Nav2
-# ------------------------------------------------------------------
-CHECK_INTERVAL    = 8.0
-MAX_RECOVERIES    = 5
-CHEAPER_THRESHOLD = 1.0
 
 # ------------------------------------------------------------------
-# RSSI Signal Strength Thresholds
-# -30 dBm = Excellent (modules touching / very close)
-# -50 dBm = Very Good (close range, clear line of sight)
-# -70 dBm = Good (normal indoor range)
-# -80 dBm = OK  ← confirmation threshold
-# -90 dBm = Weak (robot needs to creep closer)
-# -100 dBm = Very Weak (barely detectable)
-# -120 dBm = Terrible (almost out of range)
-# -164 dBm = No signal (noise floor / not your tag)
+# Tuning constants
 # ------------------------------------------------------------------
-RSSI_CONFIRM_THRESHOLD = -80
-RSSI_EXCELLENT         = -50
-RSSI_GOOD              = -70
-RSSI_WEAK              = -90
-RSSI_VERY_WEAK         = -100
-CREEP_SPEED            = 0.08
-CREEP_TIMEOUT          = 15.0
-CREEP_CHECK_INTERVAL   = 0.5
-MAX_CREEP_DISTANCE     = 1.5
-
-# ------------------------------------------------------------------
-# Unified goal definitions — coordinates + tag in one place.
-# Order here does NOT matter; greedy picks by distance at runtime.
-# ------------------------------------------------------------------
-GOAL_DEFS = [
-    {"x": 3.1,   "y":  0.513, "yaw": 0.00335, "tag": "TAG_001"},
-    {"x": 1.88,  "y": -1.91,  "yaw": 0.00206, "tag": "TAG_002"},
-    {"x": 3.72,  "y": -4.22,  "yaw": 0.00218, "tag": "TAG_003"},
-    {"x": 0.899, "y": -4.03,  "yaw": 0.00666, "tag": "TAG_004"},
-]
-
-
-def rssi_description(rssi):
-    """Return human-readable RSSI signal description."""
-    if rssi is None:
-        return "No signal"
-    elif rssi >= RSSI_EXCELLENT:
-        return "Excellent"
-    elif rssi >= RSSI_GOOD:
-        return "Good"
-    elif rssi >= RSSI_CONFIRM_THRESHOLD:
-        return "OK - above threshold"
-    elif rssi >= RSSI_WEAK:
-        return "Weak - below threshold, creeping"
-    elif rssi >= RSSI_VERY_WEAK:
-        return "Very Weak"
-    else:
-        return "No signal / noise"
+CHECK_INTERVAL    = 8.0  # seconds between mid-drive checks
+MAX_RECOVERIES    = 5    # abort current goal after this many Nav2 recoveries
+CHEAPER_THRESHOLD = 1.0  # switch if another goal has any lower path cost
 
 
 def yaw_to_quat(yaw):
@@ -79,7 +29,7 @@ def pose_from_tf(tf_stamped, frame_id):
     t = tf_stamped.transform
     ps = PoseStamped()
     ps.header.frame_id = frame_id
-    ps.header.stamp    = tf_stamped.header.stamp
+    ps.header.stamp = tf_stamped.header.stamp
     ps.pose.position.x = t.translation.x
     ps.pose.position.y = t.translation.y
     ps.pose.position.z = t.translation.z
@@ -98,79 +48,40 @@ class Greedy4Goals(Node):
         super().__init__("greedy_4_goals")
         self.map_frame  = "map"
         self.base_frame = "base_footprint"
-        self.cb_group        = ReentrantCallbackGroup()
+        self.cb_group = ReentrantCallbackGroup()
         self._shutdown       = False
         self._current_gh     = None
         self._recovery_count = 0
         self._amcl_nudged    = False
 
-        self.initial_pose_pub = self.create_publisher(
-            PoseWithCovarianceStamped, '/initialpose', 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 1)
-
-        self.nav_client = ActionClient(
-            self, NavigateToPose, "navigate_to_pose",
-            callback_group=self.cb_group)
-        self.plan_client = ActionClient(
-            self, ComputePathToPose, "compute_path_to_pose",
-            callback_group=self.cb_group)
+        self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        self.nav_client  = ActionClient(self, NavigateToPose,    "navigate_to_pose",    callback_group=self.cb_group)
+        self.plan_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose", callback_group=self.cb_group)
 
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.home_pose   = None
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 1)
 
-        # ── LoRa state ────────────────────────────────────────────
-        self._lora_tag_id = None
-        self._lora_rssi   = -999
-        self._lora_lock   = threading.Lock()
-
-        self.create_subscription(
-            String, '/lora_tag',
-            self._lora_callback, 10,
-            callback_group=self.cb_group
-        )
-        self.get_logger().info("LoRa subscriber ready on /lora_tag")
-
-        # ── Goals: list of (PoseStamped, tag_string) tuples ───────
-        # Tag always travels with its goal — no index lookup needed.
         self.goals = [
-            (self.make_goal(d["x"], d["y"], d["yaw"]), d["tag"])
-            for d in GOAL_DEFS
+            self.make_goal(3.1,0.513,0.00335),
+            self.make_goal(1.88,-1.91,0.00206),
+            self.make_goal(3.72,-4.22,0.00218),
+            self.make_goal(0.899,-4.03,0.00666),
         ]
 
         self.get_logger().info("Waiting for Nav2 action server...")
         self.nav_client.wait_for_server()
         self.plan_client.wait_for_server()
-        self.get_logger().info("Nav2 ready! Waiting 15s...")
+        self.get_logger().info("Nav2 ready! Waiting 15s for full initialization...")
         time.sleep(15.0)
         self.get_logger().info("Starting greedy navigation!")
 
-        self._nav_thread = threading.Thread(
-            target=self.navigation_loop, daemon=True)
+        self._nav_thread = threading.Thread(target=self.navigation_loop, daemon=True)
         self._nav_thread.start()
 
     # ------------------------------------------------------------------
-    # LoRa callback — expects "TAG_001,-73" from lora_serial_node.py
-    # ------------------------------------------------------------------
-
-    def _lora_callback(self, msg: String):
-        try:
-            parts  = msg.data.split(',')
-            tag_id = parts[0].strip()
-            rssi   = int(parts[1].strip()) if len(parts) > 1 else -999
-            with self._lora_lock:
-                self._lora_tag_id = tag_id
-                self._lora_rssi   = rssi
-            self.get_logger().info(
-                f"LoRa received: {tag_id} | "
-                f"RSSI: {rssi} dBm | "
-                f"Signal: {rssi_description(rssi)}"
-            )
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Stop robot
+    # Stop robot immediately
     # ------------------------------------------------------------------
 
     def stop_robot(self):
@@ -204,8 +115,7 @@ class Greedy4Goals(Node):
 
     def get_robot_pose(self):
         try:
-            tf = self.tf_buffer.lookup_transform(
-                self.map_frame, self.base_frame, rclpy.time.Time())
+            tf = self.tf_buffer.lookup_transform(self.map_frame, self.base_frame, rclpy.time.Time())
             return pose_from_tf(tf, self.map_frame)
         except Exception:
             return None
@@ -232,7 +142,7 @@ class Greedy4Goals(Node):
     # ------------------------------------------------------------------
 
     def get_path_cost(self, start, goal, timeout=5.0):
-        goal_msg           = ComputePathToPose.Goal()
+        goal_msg = ComputePathToPose.Goal()
         goal_msg.start     = start
         goal_msg.goal      = goal
         goal_msg.use_start = True
@@ -274,10 +184,8 @@ class Greedy4Goals(Node):
 
         dist = 0.0
         for i in range(1, len(poses)):
-            x0 = poses[i-1].pose.position.x
-            y0 = poses[i-1].pose.position.y
-            x1 = poses[i].pose.position.x
-            y1 = poses[i].pose.position.y
+            x0, y0 = poses[i-1].pose.position.x, poses[i-1].pose.position.y
+            x1, y1 = poses[i].pose.position.x,   poses[i].pose.position.y
             dist += math.hypot(x1 - x0, y1 - y0)
         return dist
 
@@ -290,12 +198,12 @@ class Greedy4Goals(Node):
         if pose is None:
             return
         msg = PoseWithCovarianceStamped()
-        msg.header.frame_id    = "map"
-        msg.header.stamp       = self.get_clock().now().to_msg()
-        msg.pose.pose          = pose.pose
-        msg.pose.covariance[0]  = 0.25
-        msg.pose.covariance[7]  = 0.25
-        msg.pose.covariance[35] = 0.1
+        msg.header.frame_id = "map"
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose = pose.pose
+        msg.pose.covariance[0]  = 0.25  # x uncertainty
+        msg.pose.covariance[7]  = 0.25  # y uncertainty
+        msg.pose.covariance[35] = 0.1   # yaw uncertainty
         self.initial_pose_pub.publish(msg)
         self.get_logger().info("AMCL relocalization triggered")
 
@@ -315,9 +223,9 @@ class Greedy4Goals(Node):
             if result.returncode == 0:
                 self.get_logger().info("    Local costmap cleared.")
             else:
-                self.get_logger().warn("    Clear failed.")
+                self.get_logger().warn("    Clear failed (continuing anyway).")
         except Exception:
-            self.get_logger().warn("    Clear timed out.")
+            self.get_logger().warn("    Clear timed out (continuing anyway).")
         self.get_logger().info(">>> Waiting 3s to settle...")
         time.sleep(3.0)
 
@@ -344,13 +252,8 @@ class Greedy4Goals(Node):
 
     def _send_goal_async(self, goal):
         goal.header.stamp = self.get_clock().now().to_msg()
-        ng      = NavigateToPose.Goal()
+        ng = NavigateToPose.Goal()
         ng.pose = goal
-
-        # Reset counters BEFORE sending so no stale feedback
-        # from a previous goal can bleed in via callbacks
-        self._recovery_count = 0
-        self._amcl_nudged    = False
 
         send_event   = threading.Event()
         result_event = threading.Event()
@@ -369,12 +272,10 @@ class Greedy4Goals(Node):
             recoveries = feedback_msg.feedback.number_of_recoveries
             if recoveries > self._recovery_count:
                 self._recovery_count = recoveries
-                self._amcl_nudged    = False
-                self.get_logger().warn(
-                    f"Nav2 recovery #{recoveries} triggered")
+                self._amcl_nudged = False  # new recovery = allow nudge again
+                self.get_logger().warn(f"Nav2 recovery #{recoveries} triggered")
 
-        sf = self.nav_client.send_goal_async(
-            ng, feedback_callback=feedback_cb)
+        sf = self.nav_client.send_goal_async(ng, feedback_callback=feedback_cb)
         sf.add_done_callback(goal_cb)
 
         if not send_event.wait(timeout=15.0):
@@ -384,7 +285,9 @@ class Greedy4Goals(Node):
         if gh is None or not gh.accepted:
             return None, None, None
 
-        self._current_gh = gh
+        self._current_gh     = gh
+        self._recovery_count = 0
+        self._amcl_nudged    = False
 
         rf = gh.get_result_async()
         rf.add_done_callback(result_cb)
@@ -400,25 +303,32 @@ class Greedy4Goals(Node):
         if robot is None:
             return 'continue'
 
+        # Nudge AMCL on first recovery so localization corrects
+        # itself before the robot reaches the goal
         if self._recovery_count >= 1 and not self._amcl_nudged:
             self.trigger_amcl_relocalize()
             self._amcl_nudged = True
 
+        # Trigger 1: Too many recoveries
         if self._recovery_count >= MAX_RECOVERIES:
             self.get_logger().warn(
-                f"Too many recoveries ({self._recovery_count})")
+                f"Too many recoveries ({self._recovery_count}) — switching goal"
+            )
             return 'too_many_recoveries'
 
+        # Trigger 2: Another goal is cheaper
         current_cost = self.get_path_cost(robot, current_goal, timeout=3.0)
         if current_cost is None:
-            self.get_logger().warn("Current goal unreachable")
+            self.get_logger().warn("Current goal unreachable — switching")
             return 'cheaper_found'
 
-        # Iterate over poses only — tags not needed here
-        for (other_goal, _) in self.goals:
-            other_cost = self.get_path_cost(robot, other_goal, timeout=3.0)
-            if other_cost is not None and \
-                    other_cost < current_cost * CHEAPER_THRESHOLD:
+        for other in self.goals:
+            other_cost = self.get_path_cost(robot, other, timeout=3.0)
+            if other_cost is not None and other_cost < current_cost * CHEAPER_THRESHOLD:
+                self.get_logger().warn(
+                    f"Cheaper goal ({other.pose.position.x:.2f},{other.pose.position.y:.2f}) "
+                    f"costs {other_cost:.2f}m vs current {current_cost:.2f}m — switching"
+                )
                 return 'cheaper_found'
 
         return 'continue'
@@ -431,10 +341,10 @@ class Greedy4Goals(Node):
         gh, result_event, res_box = self._send_goal_async(goal)
 
         if gh is None:
-            self.get_logger().warn("Goal rejected or timed out.")
+            self.get_logger().warn("Goal rejected or send timed out.")
             return 'failed'
 
-        self.get_logger().info("Goal accepted! Monitoring...")
+        self.get_logger().info("Goal accepted! Monitoring mid-drive...")
 
         while not result_event.wait(timeout=CHECK_INTERVAL):
             decision = self._mid_drive_check(goal)
@@ -448,192 +358,45 @@ class Greedy4Goals(Node):
         return 'failed'
 
     # ------------------------------------------------------------------
-    # LoRa-guided approach (called after Nav2 succeeds)
-    # ------------------------------------------------------------------
-
-    def _approach_via_lora(self, expected_tag: str) -> bool:
-        """
-        After Nav2 reaches coordinate, check LoRa tag.
-
-        Three cases:
-          rssi = None          → no signal at all → return False
-          rssi < threshold     → signal detected but weak → creep closer
-          rssi >= threshold    → confirmed immediately → return True
-        """
-        stop  = Twist()
-        creep = Twist()
-        creep.linear.x = CREEP_SPEED
-
-        def get_rssi():
-            with self._lora_lock:
-                if self._lora_tag_id == expected_tag:
-                    return self._lora_rssi
-            return None
-
-        # ── Phase 1: check immediately after arriving ─────────────
-        rssi = get_rssi()
-        desc = rssi_description(rssi)
-
-        self.get_logger().info(
-            f"[LoRa] Coordinate reached. "
-            f"Checking {expected_tag}... "
-            f"RSSI={rssi} dBm | Signal: {desc}"
-        )
-
-        # Case A: no signal at all — do not creep, let caller handle it
-        if rssi is None:
-            self.get_logger().warn(
-                f"[LoRa] {expected_tag} — no signal detected.")
-            return False
-
-        # Case B: signal strong enough — confirm immediately
-        if rssi >= RSSI_CONFIRM_THRESHOLD:
-            self.get_logger().info(
-                f"[LoRa] {expected_tag} CONFIRMED! "
-                f"RSSI={rssi} dBm ({desc})"
-            )
-            return True
-
-        # Case C: signal detected but too weak — creep to get closer
-        self.get_logger().warn(
-            f"[LoRa] {expected_tag} detected but weak: "
-            f"RSSI={rssi} dBm ({desc}). "
-            f"Need >= {RSSI_CONFIRM_THRESHOLD} dBm. "
-            f"Creeping forward..."
-        )
-
-        # ── Phase 2: creep toward tag ─────────────────────────────
-        start_pose = self.get_robot_pose()
-        last_rssi  = rssi
-        deadline   = time.time() + CREEP_TIMEOUT
-
-        while time.time() < deadline:
-
-            current_pose = self.get_robot_pose()
-            if start_pose and current_pose:
-                crept = self.euclidean(start_pose, current_pose)
-                if crept > MAX_CREEP_DISTANCE:
-                    self.cmd_vel_pub.publish(stop)
-                    self.get_logger().warn(
-                        f"[LoRa] Crept {crept:.2f}m — max distance reached.")
-                    return False
-
-            rssi = get_rssi()
-
-            if rssi is not None:
-                desc = rssi_description(rssi)
-                self.get_logger().info(
-                    f"[LoRa] Creeping... "
-                    f"{expected_tag} RSSI={rssi} dBm | {desc}"
-                )
-
-                if rssi >= RSSI_CONFIRM_THRESHOLD:
-                    self.cmd_vel_pub.publish(stop)
-                    self.get_logger().info(
-                        f"[LoRa] {expected_tag} CONFIRMED while creeping! "
-                        f"RSSI={rssi} dBm ({desc})"
-                    )
-                    return True
-
-                if rssi < last_rssi - 5:
-                    self.cmd_vel_pub.publish(stop)
-                    self.get_logger().warn(
-                        f"[LoRa] RSSI dropped "
-                        f"({last_rssi}→{rssi} dBm) — rotating...")
-                    rotate = Twist()
-                    rotate.angular.z = 0.3
-                    for _ in range(6):
-                        self.cmd_vel_pub.publish(rotate)
-                        time.sleep(0.2)
-
-                last_rssi = rssi
-
-            self.cmd_vel_pub.publish(creep)
-            time.sleep(CREEP_CHECK_INTERVAL)
-
-        # ── Timeout ───────────────────────────────────────────────
-        self.cmd_vel_pub.publish(stop)
-        final_rssi = get_rssi()
-        self.get_logger().warn(
-            f"[LoRa] Creep timeout for {expected_tag}. "
-            f"Final RSSI={final_rssi} dBm "
-            f"({rssi_description(final_rssi)})."
-        )
-        return False
-
-    # ------------------------------------------------------------------
     # Navigate with replan
     # ------------------------------------------------------------------
 
-    def navigate_with_replan(self, goal, expected_tag=None, max_attempts=None):
-        attempt        = 0
-        lora_confirmed = False
-
+    def navigate_with_replan(self, goal, max_attempts=None):
+        attempt = 0
         while True:
             attempt += 1
             if max_attempts is not None and attempt > max_attempts:
                 self.get_logger().warn(f"Giving up after {max_attempts} attempts.")
-                return False, False
+                return False
 
-            x = goal.pose.position.x
-            y = goal.pose.position.y
             self.get_logger().info(
-                f"Sending goal ({x:.2f},{y:.2f}) attempt {attempt}...")
+                f"Sending goal ({goal.pose.position.x:.2f},{goal.pose.position.y:.2f}) attempt {attempt}..."
+            )
 
             result = self._drive_with_monitoring(goal)
 
             if result == 'succeeded':
-                self.get_logger().info(f"Nav2 SUCCEEDED on attempt {attempt}!")
-
-                if expected_tag is not None:
-                    # Check if LoRa already sees this tag before creeping
-                    with self._lora_lock:
-                        pre_rssi = (
-                            self._lora_rssi
-                            if self._lora_tag_id == expected_tag
-                            else None
-                        )
-
-                    if pre_rssi is None:
-                        self.get_logger().info(
-                            f"[RESULT] {expected_tag} reached by "
-                            f"NAV2 COORDINATES ONLY — no LoRa signal detected."
-                        )
-                    else:
-                        lora_confirmed = self._approach_via_lora(expected_tag)
-                        if lora_confirmed:
-                            self.get_logger().info(
-                                f"[RESULT] {expected_tag} reached and "
-                                f"CONFIRMED via LoRa — robot closed in "
-                                f"using signal strength."
-                            )
-                        else:
-                            self.get_logger().warn(
-                                f"[RESULT] {expected_tag} LoRa signal "
-                                f"detected but could not reach threshold — "
-                                f"marked done by Nav2 coordinates."
-                            )
-
-                return True, lora_confirmed
+                self.get_logger().info(f"Goal SUCCEEDED on attempt {attempt}!")
+                return True
 
             elif result == 'switch_goal':
-                return False, False
+                return False
 
             elif result == 'failed':
                 robot = self.get_robot_pose()
                 if robot is not None:
                     current_cost = self.get_path_cost(robot, goal, timeout=3.0)
                     if current_cost is None:
-                        return False, False
-                    for (other_goal, _) in self.goals:
-                        other_cost = self.get_path_cost(
-                            robot, other_goal, timeout=3.0)
-                        if (other_cost is not None and
-                                other_cost < current_cost * CHEAPER_THRESHOLD):
-                            return False, False
+                        self.get_logger().warn("Goal unreachable after failure — rescoring")
+                        return False
 
-                self.get_logger().warn(
-                    f"Failed attempt {attempt}, retrying...")
+                    for other in self.goals:
+                        other_cost = self.get_path_cost(robot, other, timeout=3.0)
+                        if other_cost is not None and other_cost < current_cost * CHEAPER_THRESHOLD:
+                            self.get_logger().warn("Cheaper goal after failure — rescoring")
+                            return False
+
+                self.get_logger().warn(f"Failed (attempt {attempt}), clearing and retrying...")
                 self.clear_costmaps()
 
     # ------------------------------------------------------------------
@@ -641,16 +404,13 @@ class Greedy4Goals(Node):
     # ------------------------------------------------------------------
 
     def navigation_loop(self):
-        self.get_logger().warn(
-            "Waiting for TF — set 2D Pose Estimate in RViz!")
+        self.get_logger().warn("Waiting for TF - set 2D Pose Estimate in RViz if needed!")
         while rclpy.ok():
             pose = self.get_robot_pose()
             if pose is not None:
                 self.home_pose = pose
                 self.get_logger().info(
-                    f"Home saved: "
-                    f"({pose.pose.position.x:.2f},"
-                    f"{pose.pose.position.y:.2f})"
+                    f"Home position saved: ({pose.pose.position.x:.2f},{pose.pose.position.y:.2f})"
                 )
                 break
             time.sleep(1.0)
@@ -666,90 +426,51 @@ class Greedy4Goals(Node):
             rx, ry = robot.pose.position.x, robot.pose.position.y
             goal_num += 1
             self.get_logger().info(
-                f"===== GOAL {goal_num} | "
-                f"Robot at ({rx:.2f},{ry:.2f}) | "
-                f"{len(self.goals)} remaining ====="
+                f"===== GOAL {goal_num} | Robot at ({rx:.2f},{ry:.2f}) | {len(self.goals)} goals remaining ====="
             )
 
-            # Score all goals — unpack tuple to get pose for scoring
-            scored = [
-                (self.score_goal(robot, g), i)
-                for i, (g, tag) in enumerate(self.goals)
-            ]
+            scored = [(self.score_goal(robot, g), i) for i, g in enumerate(self.goals)]
             scored.sort()
             for score, i in scored:
-                g, tag = self.goals[i]
                 self.get_logger().info(
-                    f"  #{i} ({g.pose.position.x:.2f},"
-                    f"{g.pose.position.y:.2f}) "
-                    f"tag={tag} score={score:.2f}m"
+                    f"  #{i} ({self.goals[i].pose.position.x:.2f},{self.goals[i].pose.position.y:.2f}) score={score:.2f}m"
                 )
 
-            # Pop best goal — tag comes with it, no lookup needed
             best_score, best_idx = scored[0]
-            goal, expected_tag = self.goals.pop(best_idx)
-
+            goal = self.goals.pop(best_idx)
             self.get_logger().info(
-                f"GREEDY PICK: "
-                f"({goal.pose.position.x:.2f},"
-                f"{goal.pose.position.y:.2f}) | "
-                f"Expecting: {expected_tag} | "
-                f"{len(self.goals)} remaining"
+                f"GREEDY PICK: ({goal.pose.position.x:.2f},{goal.pose.position.y:.2f}) | {len(self.goals)} goals remaining after this"
             )
 
-            # Reset LoRa state before approaching new goal
-            with self._lora_lock:
-                self._lora_tag_id = None
-                self._lora_rssi   = -999
-
             self.clear_costmaps()
-            ok, lora_confirmed = self.navigate_with_replan(
-                goal, expected_tag=expected_tag)
+            ok = self.navigate_with_replan(goal)
 
             if ok:
                 robot_after = self.get_robot_pose()
-                pos = (
-                    f"({robot_after.pose.position.x:.2f},"
-                    f"{robot_after.pose.position.y:.2f})"
-                    if robot_after else "unknown"
-                )
-                if lora_confirmed:
-                    self.get_logger().info(
-                        f"===== GOAL {goal_num} COMPLETE | "
-                        f"LoRa guided — confirmed {expected_tag} | "
-                        f"Robot at {pos} | {len(self.goals)} left ====="
-                    )
-                else:
-                    self.get_logger().info(
-                        f"===== GOAL {goal_num} COMPLETE | "
-                        f"Nav2 coordinates only — no LoRa from {expected_tag} | "
-                        f"Robot at {pos} | {len(self.goals)} left ====="
-                    )
-                self.get_logger().info("Waiting 5s to reset...")
+                pos = (f"({robot_after.pose.position.x:.2f},{robot_after.pose.position.y:.2f})"
+                       if robot_after else "unknown")
+                self.get_logger().info(f"GOAL {goal_num} REACHED! Robot now at {pos}. {len(self.goals)} goals left.")
+                self.get_logger().info("Waiting 5s for Nav2 to reset...")
                 time.sleep(5.0)
                 self.clear_costmaps()
             else:
-                self.get_logger().warn(
-                    f"Requeueing goal {expected_tag}...")
-                self.goals.append((goal, expected_tag))
+                self.get_logger().warn("Requeueing goal and rescoring all goals...")
+                self.goals.append(goal)
                 self.clear_costmaps()
 
         self.get_logger().info("ALL GOALS COMPLETED!")
         if self.home_pose is not None:
             hx = self.home_pose.pose.position.x
             hy = self.home_pose.pose.position.y
-            self.get_logger().info(
-                f"Returning home ({hx:.2f},{hy:.2f})...")
+            self.get_logger().info(f"Returning to home ({hx:.2f},{hy:.2f})...")
             self.clear_costmaps()
-            ok, _ = self.navigate_with_replan(
-                self.home_pose, expected_tag=None, max_attempts=5)
+            ok = self.navigate_with_replan(self.home_pose, max_attempts=5)
             if ok:
-                self.get_logger().info(
-                    "MISSION COMPLETE! Robot returned home!")
+                self.get_logger().info("MISSION COMPLETE! Robot returned home!")
             else:
                 self.get_logger().warn("Failed to return home.")
         else:
-            self.get_logger().warn("Home not saved — cannot return.")
+            self.get_logger().warn("Home position not saved - cannot return.")
 
 
 # ------------------------------------------------------------------
@@ -761,13 +482,13 @@ def main():
     node = Greedy4Goals()
 
     def shutdown_handler(sig, frame):
-        node.get_logger().info('Shutting down...')
+        node.get_logger().info('Shutting down - stopping robot...')
         node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT,  shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
     executor = MultiThreadedExecutor()
