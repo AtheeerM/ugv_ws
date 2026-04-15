@@ -17,10 +17,10 @@ class LoraReader(Node):
         )
         try:
             self.serial_port = serial.Serial(
-                '/dev/ttyUSB1', 115200, timeout=1.0
+                '/dev/ttyUSB2', 115200, timeout=1.0
             )
             self.get_logger().info(
-                "LoRa Reader started on /dev/ttyUSB1"
+                "LoRa Reader started on /dev/ttyUSB2"
             )
         except Exception as e:
             self.get_logger().error(f"Serial port error: {e}")

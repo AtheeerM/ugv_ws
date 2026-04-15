@@ -30,7 +30,7 @@ def generate_launch_description():
       output='screen',
       parameters=[
         {'frame_id': 'base_lidar_link'},     # keep SAME as your template
-        {'serial_port': '/dev/ttyUSB0'},     # keep SAME port path as your template
+        {'serial_port': '/dev/ttyUSB1'},     # keep SAME port path as your template
         {'serial_baudrate': 115200},         # keep SAME baudrate as your template
 
         # "ranges and specifications" (your rplidar launch settings)

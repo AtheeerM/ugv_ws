@@ -61,7 +61,7 @@ class LDLidarDriver {
    *            ....
    *        - else definition in "ldlidar_driver/include/ldlidar_datatype.h"
    * @param serial_port_name
-   *        serial device system path, eg: "/dev/ttyUSB0"
+   *        serial device system path, eg: "/dev/ttyUSB1"
    * @param serial_baudrate
    *       serial communication baudrate value(> 0), unit is bit/s.
    * @retval value is true, start is success;
