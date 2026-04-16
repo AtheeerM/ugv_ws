@@ -38,10 +38,10 @@ MAX_CREEP_DISTANCE     = 1.5   # metres max creep from Nav2 goal point
 # Unified goal definitions — one place, no index lookup ever needed
 # ------------------------------------------------------------------
 GOAL_DEFS = [
-    {"x": 3.1,   "y":  0.513, "yaw": 0.00335, "tag": "TAG_001"},
-    {"x": 1.88,  "y": -1.91,  "yaw": 0.00206, "tag": "TAG_002"},
-    {"x": 3.72,  "y": -4.22,  "yaw": 0.00218, "tag": "TAG_003"},
-    {"x": 0.899, "y": -4.03,  "yaw": 0.00666, "tag": "TAG_004"},
+    {"x": 1.43,   "y":  0.168, "yaw": 0.000866, "tag": "TAG_001"},
+    {"x": 1.22,  "y": -1.72,  "yaw": 0.0021, "tag": "TAG_002"},
+    {"x": 0.524,  "y": -1.85,  "yaw": 0.00252, "tag": "TAG_003"},
+    {"x": 0.813, "y": -0.685,  "yaw": 0.00349, "tag": "TAG_004"},
 ]
 
 
