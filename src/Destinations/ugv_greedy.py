@@ -18,8 +18,8 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 # Tuning constants — Nav2 (unchanged from working code)
 # ------------------------------------------------------------------
 CHECK_INTERVAL    = 8.0
-MAX_RECOVERIES    = 10
-CHEAPER_THRESHOLD = 0.80
+MAX_RECOVERIES    = 5
+CHEAPER_THRESHOLD = 0.75
 
 # ------------------------------------------------------------------
 # LoRa / RSSI constants
@@ -41,7 +41,7 @@ GOAL_DEFS = [
     {"x": 1.43,   "y":  0.168, "yaw": 0.000866, "tag": "TAG_001"},
     {"x": 1.22,  "y": -1.72,  "yaw": 0.0021, "tag": "TAG_002"},
     {"x": 0.60, "y": -1.70, "yaw": 0.00252, "tag": "TAG_003"},
-    {"x": 0.813, "y": -0.685,  "yaw": 0.00349, "tag": "TAG_004"},
+    {"x": 0.90, "y": -0.50, "yaw": 0.00349, "tag": "TAG_004"},,
 ]
 
 
