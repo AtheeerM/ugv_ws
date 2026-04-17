@@ -107,6 +107,7 @@ class Greedy4Goals(Node):
         self._lora_tag_id = None
         self._lora_rssi   = -999
         self._lora_lock   = threading.Lock()
+        self._lora_last_seen = {}  # tag_id → (rssi, timestamp)
 
         self.create_subscription(
             String, '/lora_tag',
@@ -127,6 +128,7 @@ class Greedy4Goals(Node):
         self.get_logger().info("Nav2 ready! Waiting 15s for full initialization...")
         time.sleep(15.0)
         self.get_logger().info("Starting greedy navigation!")
+        
 
         self._nav_thread = threading.Thread(
             target=self.navigation_loop, daemon=True)
@@ -144,6 +146,7 @@ class Greedy4Goals(Node):
             with self._lora_lock:
                 self._lora_tag_id = tag_id
                 self._lora_rssi   = rssi
+                self._lora_last_seen[tag_id] = (rssi, time.time())
             # Remove or comment out this line:
             # self.get_logger().info(f"LoRa received: ...")
         except Exception:
@@ -297,7 +300,7 @@ class Greedy4Goals(Node):
         except Exception:
             self.get_logger().warn("    Clear timed out (continuing anyway).")
         self.get_logger().info(">>> Waiting 3s to settle...")
-        time.sleep(3.0)
+        time.sleep(5.0)
 
     # ------------------------------------------------------------------
     # Cancel active Nav2 goal
@@ -435,8 +438,9 @@ class Greedy4Goals(Node):
 
         def get_rssi():
             with self._lora_lock:
-                if self._lora_tag_id == expected_tag:
-                    return self._lora_rssi
+                entry = self._lora_last_seen.get(expected_tag)
+                if entry and (time.time() - entry[1]) < 5.0:
+                    return entry[0]
             return None
 
         # Phase 1: check immediately on arrival
@@ -544,11 +548,8 @@ class Greedy4Goals(Node):
                 # ── LoRa check — only after Nav2 is done ──────────
                 if expected_tag is not None:
                     with self._lora_lock:
-                        pre_rssi = (
-                            self._lora_rssi
-                            if self._lora_tag_id == expected_tag
-                            else None
-                        )
+                        entry = self._lora_last_seen.get(expected_tag)
+                        pre_rssi = entry[0] if entry and (time.time() - entry[1]) < 5.0 else None
 
                     if pre_rssi is None:
                         # No LoRa signal at all — accept Nav2 result
@@ -660,6 +661,7 @@ class Greedy4Goals(Node):
             with self._lora_lock:
                 self._lora_tag_id = None
                 self._lora_rssi   = -999
+                self._lora_last_seen.pop(expected_tag, None)  # clear only this tag
 
             self.clear_costmaps()
             ok, lora_confirmed = self.navigate_with_replan(
