@@ -433,8 +433,10 @@ class Greedy4Goals(Node):
 
     def _approach_via_lora(self, expected_tag: str) -> bool:
         stop  = Twist()
-        creep = Twist()
-        creep.linear.x = CREEP_SPEED
+        creep_fwd = Twist()
+        creep_bwd = Twist()
+        creep_fwd.linear.x =  CREEP_SPEED
+        creep_bwd.linear.x = -CREEP_SPEED
 
         def get_rssi():
             with self._lora_lock:
@@ -443,50 +445,111 @@ class Greedy4Goals(Node):
                     return entry[0]
             return None
 
-        # Phase 1: check immediately on arrival
+        def sample_rssi(duration=1.0):
+            """Collect RSSI samples over duration seconds and return average."""
+            samples = []
+            deadline = time.time() + duration
+            while time.time() < deadline:
+                r = get_rssi()
+                if r is not None:
+                    samples.append(r)
+                time.sleep(0.2)
+            return sum(samples) / len(samples) if samples else None
+
+        # Phase 1: check on arrival
         rssi = get_rssi()
         self.get_logger().info(
-            f"[LoRa] Arrived at {expected_tag} coordinate. "
+            f"[LoRa] Arrived at {expected_tag}. "
             f"RSSI={rssi} dBm | {rssi_description(rssi)}"
         )
 
-        # No signal — mark as nav-only, move on
         if rssi is None:
             self.get_logger().warn(
                 f"[LoRa] {expected_tag} — no signal, marking Nav2-only.")
             return False
 
-        # Strong enough — confirmed immediately
         if rssi >= RSSI_CONFIRM_THRESHOLD:
             self.get_logger().info(
                 f"[LoRa] {expected_tag} CONFIRMED! RSSI={rssi} dBm")
             return True
 
-        # Weak signal — creep closer
         self.get_logger().warn(
             f"[LoRa] {expected_tag} weak signal ({rssi} dBm), "
-            f"need >= {RSSI_CONFIRM_THRESHOLD}. Creeping...")
+            f"need >= {RSSI_CONFIRM_THRESHOLD}. Probing direction...")
 
-        # Phase 2: creep
+        # Phase 2: probe forward
+        self.cmd_vel_pub.publish(creep_fwd)
+        time.sleep(1.0)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+        rssi_fwd = sample_rssi(1.0)
+
+        # Return to start
+        self.cmd_vel_pub.publish(creep_bwd)
+        time.sleep(1.0)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+        rssi_start = sample_rssi(1.0)
+
+        # Probe backward
+        self.cmd_vel_pub.publish(creep_bwd)
+        time.sleep(1.0)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+        rssi_bwd = sample_rssi(1.0)
+
+        # Return to start
+        self.cmd_vel_pub.publish(creep_fwd)
+        time.sleep(1.0)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+
+        self.get_logger().info(
+            f"[LoRa] Probe results — fwd:{rssi_fwd} bwd:{rssi_bwd} start:{rssi_start}"
+        )
+
+        # Pick best direction
+        if rssi_fwd is None and rssi_bwd is None:
+            self.get_logger().warn("[LoRa] No signal in either direction.")
+            return False
+
+        if rssi_fwd is not None and rssi_fwd >= RSSI_CONFIRM_THRESHOLD:
+            self.get_logger().info(f"[LoRa] {expected_tag} CONFIRMED forward! RSSI={rssi_fwd}")
+            return True
+
+        if rssi_bwd is not None and rssi_bwd >= RSSI_CONFIRM_THRESHOLD:
+            self.get_logger().info(f"[LoRa] {expected_tag} CONFIRMED backward! RSSI={rssi_bwd}")
+            return True
+
+        # Choose direction with stronger signal
+        fwd_val = rssi_fwd if rssi_fwd is not None else -999
+        bwd_val = rssi_bwd if rssi_bwd is not None else -999
+        go_forward = fwd_val >= bwd_val
+
+        direction = creep_fwd if go_forward else creep_bwd
+        dir_name  = "forward" if go_forward else "backward"
+        self.get_logger().info(
+            f"[LoRa] Creeping {dir_name} — "
+            f"fwd={rssi_fwd} bwd={rssi_bwd}"
+        )
+
+        # Phase 3: creep in chosen direction
         start_pose = self.get_robot_pose()
-        last_rssi  = rssi
+        last_rssi  = rssi_start or rssi
         deadline   = time.time() + CREEP_TIMEOUT
 
         while time.time() < deadline:
-
-            # Distance guard
             current_pose = self.get_robot_pose()
             if start_pose and current_pose:
                 if self.euclidean(start_pose, current_pose) > MAX_CREEP_DISTANCE:
                     self.cmd_vel_pub.publish(stop)
-                    self.get_logger().warn(
-                        f"[LoRa] Max creep distance reached.")
+                    self.get_logger().warn("[LoRa] Max creep distance reached.")
                     return False
 
             rssi = get_rssi()
             if rssi is not None:
                 self.get_logger().info(
-                    f"[LoRa] Creeping... {expected_tag} "
+                    f"[LoRa] Creeping {dir_name}... {expected_tag} "
                     f"RSSI={rssi} dBm | {rssi_description(rssi)}"
                 )
 
@@ -497,23 +560,21 @@ class Greedy4Goals(Node):
                         f"RSSI={rssi} dBm")
                     return True
 
-                # RSSI dropped — rotate to reacquire
+                # Signal dropped — reverse direction
                 if rssi < last_rssi - 5:
                     self.cmd_vel_pub.publish(stop)
                     self.get_logger().warn(
-                        f"[LoRa] RSSI dropped ({last_rssi}→{rssi}), rotating...")
-                    rotate = Twist()
-                    rotate.angular.z = 0.3
-                    for _ in range(6):
-                        self.cmd_vel_pub.publish(rotate)
-                        time.sleep(0.2)
+                        f"[LoRa] RSSI dropped ({last_rssi}→{rssi}), "
+                        f"reversing direction...")
+                    direction = creep_bwd if go_forward else creep_fwd
+                    go_forward = not go_forward
+                    dir_name   = "forward" if go_forward else "backward"
 
                 last_rssi = rssi
 
-            self.cmd_vel_pub.publish(creep)
+            self.cmd_vel_pub.publish(direction)
             time.sleep(CREEP_CHECK_INTERVAL)
 
-        # Timeout
         self.cmd_vel_pub.publish(stop)
         self.get_logger().warn(
             f"[LoRa] Creep timeout for {expected_tag}. "
