@@ -18,13 +18,13 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 # Tuning constants — Nav2 (unchanged from working code)
 # ------------------------------------------------------------------
 CHECK_INTERVAL    = 8.0
-MAX_RECOVERIES    = 5
+MAX_RECOVERIES    = 10
 CHEAPER_THRESHOLD = 0.80
 
 # ------------------------------------------------------------------
 # LoRa / RSSI constants
 # ------------------------------------------------------------------
-RSSI_CONFIRM_THRESHOLD = -80   # minimum RSSI to confirm tag
+RSSI_CONFIRM_THRESHOLD = -50   # minimum RSSI to confirm tag
 RSSI_EXCELLENT         = -50
 RSSI_GOOD              = -70
 RSSI_WEAK              = -90
