@@ -435,12 +435,9 @@ class Greedy4Goals(Node):
         stop      = Twist()
         creep_fwd = Twist(); creep_fwd.linear.x =  CREEP_SPEED
         creep_bwd = Twist(); creep_bwd.linear.x = -CREEP_SPEED
-        rotate_cw = Twist(); rotate_cw.angular.z  = -0.3
-        rotate_ccw= Twist(); rotate_ccw.angular.z =  0.3
-        for _ in range(10):
-            self.cmd_vel_pub.publish(stop)
-            time.sleep(0.1)
-        time.sleep(1.5)
+        rotate_cw = Twist(); rotate_cw.angular.z  = -0.2
+        rotate_ccw= Twist(); rotate_ccw.angular.z =  0.2
+
         def get_rssi():
             with self._lora_lock:
                 entry = self._lora_last_seen.get(expected_tag)
@@ -458,7 +455,13 @@ class Greedy4Goals(Node):
                 time.sleep(0.2)
             return sum(samples) / len(samples) if samples else None
 
-        # ── Phase 1: check on arrival ──────────────────────────────
+        # ── Release Nav2 control ────────────────────────────────────
+        for _ in range(10):
+            self.cmd_vel_pub.publish(stop)
+            time.sleep(0.1)
+        time.sleep(1.5)
+
+        # ── Phase 1: check on arrival ───────────────────────────────
         rssi = get_rssi()
         self.get_logger().info(
             f"[LoRa] Arrived at {expected_tag}. "
@@ -477,11 +480,12 @@ class Greedy4Goals(Node):
             f"[LoRa] Weak signal ({rssi} dBm). Rotating to find best heading..."
         )
 
-        # ── Phase 2: rotate 360° slowly, record best heading time ──
-        best_rssi      = rssi
-        best_elapsed   = 0.0
-        rotation_speed = 0.2   # rad/s
-        full_rotation  = (2 * math.pi) / rotation_speed  # ~15.7 seconds
+        # ── Phase 2: rotate, stop when peak passes ──────────────────
+        best_rssi        = rssi
+        best_elapsed     = 0.0
+        drops_after_peak = 0
+        rotation_speed   = 0.2
+        full_rotation    = (2 * math.pi) / rotation_speed  # max 31s
 
         self.cmd_vel_pub.publish(rotate_ccw)
         rot_start = time.time()
@@ -499,9 +503,106 @@ class Greedy4Goals(Node):
                         f"[LoRa] {expected_tag} CONFIRMED while rotating! RSSI={r}")
                     return True
                 if r > best_rssi:
-                    best_rssi    = r
-                    best_elapsed = elapsed
+                    best_rssi        = r
+                    best_elapsed     = elapsed
+                    drops_after_peak = 0
+                elif best_rssi > rssi and r < best_rssi - 3:
+                    drops_after_peak += 1
+                    if drops_after_peak >= 3:
+                        self.get_logger().info(
+                            f"[LoRa] Peak passed, stopping rotation early at t={elapsed:.1f}s")
+                        break
             time.sleep(0.3)
+
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+
+        self.get_logger().info(
+            f"[LoRa] Best heading at t={best_elapsed:.1f}s RSSI={best_rssi} dBm"
+        )
+
+        # ── Phase 3: rotate back to best heading ────────────────────
+        elapsed_now      = time.time() - rot_start
+        time_to_best     = elapsed_now - best_elapsed
+        self.get_logger().info(
+            f"[LoRa] Rotating back {time_to_best:.1f}s to best heading..."
+        )
+        self.cmd_vel_pub.publish(rotate_cw)
+        time.sleep(time_to_best)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.5)
+
+        rssi_after_rotate = sample_rssi(1.0)
+        self.get_logger().info(
+            f"[LoRa] At best heading. RSSI={rssi_after_rotate} dBm"
+        )
+
+        if rssi_after_rotate and rssi_after_rotate >= RSSI_CONFIRM_THRESHOLD:
+            self.get_logger().info(f"[LoRa] {expected_tag} CONFIRMED at best heading!")
+            return True
+
+        # ── Phase 4: creep, hold within ±2 dBm of best ─────────────
+        self.get_logger().info("[LoRa] Creeping toward tag...")
+        start_pose        = self.get_robot_pose()
+        last_rssi         = rssi_after_rotate or best_rssi
+        peak_rssi         = last_rssi
+        consecutive_drops = 0
+        direction         = creep_fwd
+        go_forward        = True
+        deadline          = time.time() + CREEP_TIMEOUT
+
+        while time.time() < deadline:
+            current_pose = self.get_robot_pose()
+            if start_pose and current_pose:
+                if self.euclidean(start_pose, current_pose) > MAX_CREEP_DISTANCE:
+                    self.cmd_vel_pub.publish(stop)
+                    self.get_logger().warn("[LoRa] Max creep distance reached.")
+                    return False
+
+            rssi = get_rssi()
+            if rssi is not None:
+                self.get_logger().info(
+                    f"[LoRa] Creeping... RSSI={rssi} dBm | {rssi_description(rssi)}"
+                )
+
+                if rssi >= RSSI_CONFIRM_THRESHOLD:
+                    self.cmd_vel_pub.publish(stop)
+                    self.get_logger().info(
+                        f"[LoRa] {expected_tag} CONFIRMED! RSSI={rssi}")
+                    return True
+
+                # Track peak
+                if rssi > peak_rssi:
+                    peak_rssi = rssi
+
+                if rssi < last_rssi - 2:
+                    consecutive_drops += 1
+                    if consecutive_drops >= 2:
+                        self.cmd_vel_pub.publish(stop)
+                        self.get_logger().warn(
+                            f"[LoRa] Signal dropped ({last_rssi}→{rssi}), reversing and holding")
+                        # Reverse briefly to recover signal
+                        recover = creep_bwd if go_forward else creep_fwd
+                        self.cmd_vel_pub.publish(recover)
+                        time.sleep(0.5)
+                        self.cmd_vel_pub.publish(stop)
+                        time.sleep(2.0)  # hold position
+                        consecutive_drops = 0
+                        go_forward = not go_forward
+                        last_rssi = get_rssi() or rssi
+                        continue
+                else:
+                    consecutive_drops = 0
+
+                last_rssi = rssi
+
+            self.cmd_vel_pub.publish(direction)
+            time.sleep(CREEP_CHECK_INTERVAL)
+
+        self.cmd_vel_pub.publish(stop)
+        self.get_logger().warn(
+            f"[LoRa] Timeout for {expected_tag}. Final RSSI={get_rssi()} dBm.")
+        return False
 
         self.cmd_vel_pub.publish(stop)
         time.sleep(0.3)
