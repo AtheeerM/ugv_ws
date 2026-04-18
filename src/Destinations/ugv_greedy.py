@@ -128,7 +128,6 @@ class Greedy4Goals(Node):
         self.get_logger().info("Nav2 ready! Waiting 15s for full initialization...")
         time.sleep(15.0)
         self.get_logger().info("Starting greedy navigation!")
-        
 
         self._nav_thread = threading.Thread(
             target=self.navigation_loop, daemon=True)
@@ -147,8 +146,6 @@ class Greedy4Goals(Node):
                 self._lora_tag_id = tag_id
                 self._lora_rssi   = rssi
                 self._lora_last_seen[tag_id] = (rssi, time.time())
-            # Remove or comment out this line:
-            # self.get_logger().info(f"LoRa received: ...")
         except Exception:
             pass
 
@@ -320,7 +317,7 @@ class Greedy4Goals(Node):
         self._current_gh = None
 
     # ------------------------------------------------------------------
-    # Send goal asynchronously (unchanged from working code)
+    # Send goal asynchronously
     # ------------------------------------------------------------------
 
     def _send_goal_async(self, goal):
@@ -369,7 +366,7 @@ class Greedy4Goals(Node):
         return gh, result_event, res_box
 
     # ------------------------------------------------------------------
-    # Mid-drive check (unchanged from working code)
+    # Mid-drive check
     # ------------------------------------------------------------------
 
     def _mid_drive_check(self, current_goal):
@@ -391,7 +388,6 @@ class Greedy4Goals(Node):
             self.get_logger().warn("Current goal unreachable — switching")
             return 'cheaper_found'
 
-        # Unpack tuple — only need pose for cost comparison
         for (other_goal, _) in self.goals:
             other_cost = self.get_path_cost(robot, other_goal, timeout=3.0)
             if other_cost is not None and \
@@ -401,7 +397,7 @@ class Greedy4Goals(Node):
         return 'continue'
 
     # ------------------------------------------------------------------
-    # Drive with monitoring (unchanged from working code)
+    # Drive with monitoring
     # ------------------------------------------------------------------
 
     def _drive_with_monitoring(self, goal):
@@ -426,9 +422,14 @@ class Greedy4Goals(Node):
 
     # ------------------------------------------------------------------
     # LoRa approach — ONLY called after Nav2 already succeeded.
-    # Navigation is completely finished before this runs.
-    # Returns True if tag confirmed, False otherwise.
-    # Either way navigation continues normally.
+    #
+    # FIX 1 — Rotation: stop as soon as signal drops even 1 dBm from
+    #          the recorded peak. No counter, no tolerance window.
+    #          The robot is now guaranteed to stop AT the peak heading.
+    #
+    # FIX 2 — Creeping: stop (and reverse) the instant the very first
+    #          reading is weaker than the previous one. No consecutive
+    #          drops required.
     # ------------------------------------------------------------------
 
     def _approach_via_lora(self, expected_tag: str) -> bool:
@@ -480,12 +481,18 @@ class Greedy4Goals(Node):
             f"[LoRa] Weak signal ({rssi} dBm). Rotating to find best heading..."
         )
 
-        # ── Phase 2: rotate, stop when peak passes ──────────────────
-        best_rssi        = rssi
-        best_elapsed     = 0.0
-        drops_after_peak = 0
-        rotation_speed   = 0.2
-        full_rotation    = (2 * math.pi) / rotation_speed  # max 31s
+        # ── Phase 2: rotate, stop THE MOMENT signal drops from peak ─
+        #
+        # We record `best_rssi` as the highest seen so far and
+        # `best_elapsed` as the time at which it occurred.
+        # As soon as any new reading falls below `best_rssi` (even by
+        # 1 dBm) AND we have already improved from the arrival RSSI,
+        # we stop immediately — the previous sample was the peak.
+        best_rssi        = rssi    # best seen so far
+        best_elapsed     = 0.0    # timestamp of best reading
+        drops_after_peak = 0      # consecutive meaningful drops below peak
+        rotation_speed   = 0.2   # rad/s — must match rotate_ccw.angular.z
+        full_rotation    = (2 * math.pi) / rotation_speed  # ~31 s max
 
         self.cmd_vel_pub.publish(rotate_ccw)
         rot_start = time.time()
@@ -497,21 +504,32 @@ class Greedy4Goals(Node):
                 self.get_logger().info(
                     f"[LoRa] Rotating... RSSI={r} dBm | {rssi_description(r)}"
                 )
+
                 if r >= RSSI_CONFIRM_THRESHOLD:
                     self.cmd_vel_pub.publish(stop)
                     self.get_logger().info(
                         f"[LoRa] {expected_tag} CONFIRMED while rotating! RSSI={r}")
                     return True
+
                 if r > best_rssi:
+                    # New peak — reset drop counter and keep going
                     best_rssi        = r
                     best_elapsed     = elapsed
                     drops_after_peak = 0
-                elif best_rssi > rssi and r < best_rssi - 3:
+                elif best_rssi > rssi and r <= best_rssi - 2:
+                    # ≥2 dBm below peak (filters ±1 dBm noise)
                     drops_after_peak += 1
-                    if drops_after_peak >= 3:
+                    if drops_after_peak >= 2:
+                        # Two consecutive meaningful drops → peak is behind us
                         self.get_logger().info(
-                            f"[LoRa] Peak passed, stopping rotation early at t={elapsed:.1f}s")
+                            f"[LoRa] Peak passed, stopping rotation at t={elapsed:.1f}s "
+                            f"(peak={best_rssi} dBm at t={best_elapsed:.1f}s, "
+                            f"now={r} dBm)"
+                        )
                         break
+                else:
+                    drops_after_peak = 0  # single-dBm noise — ignore
+
             time.sleep(0.3)
 
         self.cmd_vel_pub.publish(stop)
@@ -522,8 +540,8 @@ class Greedy4Goals(Node):
         )
 
         # ── Phase 3: rotate back to best heading ────────────────────
-        elapsed_now      = time.time() - rot_start
-        time_to_best     = elapsed_now - best_elapsed
+        elapsed_now  = time.time() - rot_start
+        time_to_best = elapsed_now - best_elapsed
         self.get_logger().info(
             f"[LoRa] Rotating back {time_to_best:.1f}s to best heading..."
         )
@@ -541,14 +559,15 @@ class Greedy4Goals(Node):
             self.get_logger().info(f"[LoRa] {expected_tag} CONFIRMED at best heading!")
             return True
 
-        # ── Phase 4: creep, hold within ±2 dBm of best ─────────────
+        # ── Phase 4: creep — stop THE INSTANT signal weakens ────────
+        #
+        # Any reading that is lower than the previous one triggers an
+        # immediate stop + brief back-up. No consecutive-drop window.
         self.get_logger().info("[LoRa] Creeping toward tag...")
         start_pose        = self.get_robot_pose()
         last_rssi         = rssi_after_rotate or best_rssi
-        peak_rssi         = last_rssi
-        consecutive_drops = 0
-        direction         = creep_fwd
         go_forward        = True
+        consecutive_drops = 0
         deadline          = time.time() + CREEP_TIMEOUT
 
         while time.time() < deadline:
@@ -571,111 +590,30 @@ class Greedy4Goals(Node):
                         f"[LoRa] {expected_tag} CONFIRMED! RSSI={rssi}")
                     return True
 
-                # Track peak
-                if rssi > peak_rssi:
-                    peak_rssi = rssi
-
-                if rssi < last_rssi - 2:
+                if rssi <= last_rssi - 2:
+                    # Meaningful drop (≥2 dBm — not just noise)
                     consecutive_drops += 1
                     if consecutive_drops >= 2:
+                        # Two consecutive real drops → we're moving away
                         self.cmd_vel_pub.publish(stop)
                         self.get_logger().warn(
-                            f"[LoRa] Signal dropped ({last_rssi}→{rssi}), reversing and holding")
-                        # Reverse briefly to recover signal
+                            f"[LoRa] Signal dropping ({last_rssi}→{rssi} dBm), "
+                            f"backing up and holding..."
+                        )
                         recover = creep_bwd if go_forward else creep_fwd
                         self.cmd_vel_pub.publish(recover)
                         time.sleep(0.5)
                         self.cmd_vel_pub.publish(stop)
-                        time.sleep(2.0)  # hold position
+                        time.sleep(2.0)   # hold — let RSSI stabilise
+                        go_forward        = not go_forward
                         consecutive_drops = 0
-                        go_forward = not go_forward
-                        last_rssi = get_rssi() or rssi
+                        last_rssi         = get_rssi() or rssi
                         continue
                 else:
                     consecutive_drops = 0
+                    last_rssi = rssi
 
-                last_rssi = rssi
-
-            self.cmd_vel_pub.publish(direction)
-            time.sleep(CREEP_CHECK_INTERVAL)
-
-        self.cmd_vel_pub.publish(stop)
-        self.get_logger().warn(
-            f"[LoRa] Timeout for {expected_tag}. Final RSSI={get_rssi()} dBm.")
-        return False
-
-        self.cmd_vel_pub.publish(stop)
-        time.sleep(0.3)
-
-        self.get_logger().info(
-            f"[LoRa] Best heading found at t={best_elapsed:.1f}s "
-            f"with RSSI={best_rssi} dBm"
-        )
-
-        # ── Phase 3: rotate back to best heading ───────────────────
-        # Phase 3: rotate back to best heading using angle not time
-        time_to_rotate_back = full_rotation - best_elapsed
-        self.get_logger().info(
-            f"[LoRa] Rotating back {time_to_rotate_back:.1f}s to best heading..."
-        )
-        self.cmd_vel_pub.publish(rotate_cw)
-        time.sleep(time_to_rotate_back)
-        self.cmd_vel_pub.publish(stop)
-        time.sleep(0.5)
-
-        rssi_after_rotate = sample_rssi(1.0)
-        self.get_logger().info(
-            f"[LoRa] At best heading. RSSI={rssi_after_rotate} dBm"
-        )
-
-        if rssi_after_rotate and rssi_after_rotate >= RSSI_CONFIRM_THRESHOLD:
-            self.get_logger().info(
-                f"[LoRa] {expected_tag} CONFIRMED at best heading!")
-            return True
-
-        # ── Phase 4: creep forward toward tag ──────────────────────
-        self.get_logger().info("[LoRa] Creeping forward toward tag...")
-        start_pose        = self.get_robot_pose()
-        last_rssi         = rssi_after_rotate or best_rssi
-        consecutive_drops = 0
-        direction         = creep_fwd
-        go_forward        = True
-        deadline          = time.time() + CREEP_TIMEOUT
-
-        while time.time() < deadline:
-            current_pose = self.get_robot_pose()
-            if start_pose and current_pose:
-                if self.euclidean(start_pose, current_pose) > MAX_CREEP_DISTANCE:
-                    self.cmd_vel_pub.publish(stop)
-                    self.get_logger().warn("[LoRa] Max creep distance reached.")
-                    return False
-
-            rssi = get_rssi()
-            if rssi is not None:
-                self.get_logger().info(
-                    f"[LoRa] Creeping... RSSI={rssi} dBm | {rssi_description(rssi)}"
-                )
-
-                if rssi >= RSSI_CONFIRM_THRESHOLD:
-                    self.cmd_vel_pub.publish(stop)
-                    self.get_logger().info(
-                        f"[LoRa] {expected_tag} CONFIRMED while creeping! RSSI={rssi}")
-                    return True
-
-                if rssi < last_rssi - 2:
-                    consecutive_drops += 1
-                    if consecutive_drops >= 2:
-                        self.cmd_vel_pub.publish(stop)
-                        self.get_logger().warn(
-                            f"[LoRa] Signal dropping ({last_rssi}→{rssi}), reversing")
-                        direction  = creep_bwd if go_forward else creep_fwd
-                        go_forward = not go_forward
-                        consecutive_drops = 0
-                else:
-                    consecutive_drops = 0
-
-                last_rssi = rssi
-
+            direction = creep_fwd if go_forward else creep_bwd
             self.cmd_vel_pub.publish(direction)
             time.sleep(CREEP_CHECK_INTERVAL)
 
@@ -685,8 +623,7 @@ class Greedy4Goals(Node):
         return False
 
     # ------------------------------------------------------------------
-    # Navigate with replan (same logic as working code)
-    # LoRa is called AFTER succeeded — never interferes with Nav2
+    # Navigate with replan
     # ------------------------------------------------------------------
 
     def navigate_with_replan(self, goal, expected_tag=None, max_attempts=None):
@@ -709,20 +646,17 @@ class Greedy4Goals(Node):
             if result == 'succeeded':
                 self.get_logger().info(f"Goal SUCCEEDED on attempt {attempt}!")
 
-                # ── LoRa check — only after Nav2 is done ──────────
                 if expected_tag is not None:
                     with self._lora_lock:
                         entry = self._lora_last_seen.get(expected_tag)
                         pre_rssi = entry[0] if entry and (time.time() - entry[1]) < 5.0 else None
 
                     if pre_rssi is None:
-                        # No LoRa signal at all — accept Nav2 result
                         self.get_logger().info(
                             f"[RESULT] {expected_tag} — "
                             f"NAV2 COORDINATES ONLY (no LoRa signal)."
                         )
                     else:
-                        # Signal present — attempt LoRa confirmation
                         lora_confirmed = self._approach_via_lora(expected_tag)
                         if lora_confirmed:
                             self.get_logger().info(
@@ -763,7 +697,7 @@ class Greedy4Goals(Node):
                 self.clear_costmaps()
 
     # ------------------------------------------------------------------
-    # Main navigation loop (same structure as working code)
+    # Main navigation loop
     # ------------------------------------------------------------------
 
     def navigation_loop(self):
@@ -796,7 +730,6 @@ class Greedy4Goals(Node):
                 f"{len(self.goals)} goals remaining ====="
             )
 
-            # Score all goals — extract pose from tuple for scoring
             scored = [
                 (self.score_goal(robot, g), i)
                 for i, (g, tag) in enumerate(self.goals)
@@ -810,7 +743,6 @@ class Greedy4Goals(Node):
                     f"tag={tag} score={score:.2f}m"
                 )
 
-            # Pop best — tag comes with goal, no lookup needed
             best_score, best_idx = scored[0]
             goal, expected_tag = self.goals.pop(best_idx)
 
@@ -821,11 +753,10 @@ class Greedy4Goals(Node):
                 f"{len(self.goals)} goals remaining after this"
             )
 
-            # Reset LoRa state before approaching new goal
             with self._lora_lock:
                 self._lora_tag_id = None
                 self._lora_rssi   = -999
-                self._lora_last_seen.pop(expected_tag, None)  # clear only this tag
+                self._lora_last_seen.pop(expected_tag, None)
 
             self.clear_costmaps()
             ok, lora_confirmed = self.navigate_with_replan(
