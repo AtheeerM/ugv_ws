@@ -30,9 +30,8 @@ RSSI_GOOD              = -70
 RSSI_WEAK              = -90
 RSSI_VERY_WEAK         = -100
 CREEP_SPEED            = 0.08  # m/s forward creep
-CREEP_TIMEOUT          = 15.0  # seconds before giving up creep
+CREEP_TIMEOUT          = 2.0   # seconds before giving up creep
 CREEP_CHECK_INTERVAL   = 0.5   # seconds between RSSI checks while creeping
-MAX_CREEP_DISTANCE     = 1.5   # metres max creep from Nav2 goal point
 
 # ------------------------------------------------------------------
 # Unified goal definitions — one place, no index lookup ever needed
@@ -539,14 +538,54 @@ class Greedy4Goals(Node):
             f"[LoRa] Best heading at t={best_elapsed:.1f}s RSSI={best_rssi} dBm"
         )
 
-        # ── Phase 3: rotate back to best heading ────────────────────
-        elapsed_now  = time.time() - rot_start
-        time_to_best = elapsed_now - best_elapsed
+        # ── Phase 3: rotate back CW, guided by RSSI (not time-blind) ──
+        #
+        # Time-based rotate-back is unreliable — actual angular velocity
+        # differs from the commanded value, causing multi-dBm errors.
+        # Instead, rotate CW while watching RSSI; stop when RSSI peaks
+        # and then drops again (same 2-drop/2dBm logic as forward scan).
+        elapsed_now   = time.time() - rot_start
+        time_to_best  = elapsed_now - best_elapsed
+        # Allow slightly more than time_to_best so we don't undershoot
+        max_back_time = time_to_best + 2.0
+
         self.get_logger().info(
-            f"[LoRa] Rotating back {time_to_best:.1f}s to best heading..."
+            f"[LoRa] Rotating back (~{time_to_best:.1f}s) to best heading, "
+            f"RSSI-guided..."
         )
+
+        back_best_rssi        = None
+        back_drops_after_peak = 0
+
         self.cmd_vel_pub.publish(rotate_cw)
-        time.sleep(time_to_best)
+        back_start = time.time()
+
+        while time.time() - back_start < max_back_time:
+            r = get_rssi()
+            if r is not None:
+                self.get_logger().info(f"[LoRa] Rotating back... RSSI={r} dBm")
+
+                if r >= RSSI_CONFIRM_THRESHOLD:
+                    self.cmd_vel_pub.publish(stop)
+                    self.get_logger().info(
+                        f"[LoRa] {expected_tag} CONFIRMED while rotating back! RSSI={r}")
+                    return True
+
+                if back_best_rssi is None or r > back_best_rssi:
+                    back_best_rssi        = r
+                    back_drops_after_peak = 0
+                elif back_best_rssi is not None and r <= back_best_rssi - 2:
+                    back_drops_after_peak += 1
+                    if back_drops_after_peak >= 2:
+                        self.get_logger().info(
+                            f"[LoRa] Peak found while rotating back. "
+                            f"RSSI={back_best_rssi} dBm, stopping."
+                        )
+                        break
+                else:
+                    back_drops_after_peak = 0
+            time.sleep(0.3)
+
         self.cmd_vel_pub.publish(stop)
         time.sleep(0.5)
 
@@ -571,12 +610,6 @@ class Greedy4Goals(Node):
         deadline          = time.time() + CREEP_TIMEOUT
 
         while time.time() < deadline:
-            current_pose = self.get_robot_pose()
-            if start_pose and current_pose:
-                if self.euclidean(start_pose, current_pose) > MAX_CREEP_DISTANCE:
-                    self.cmd_vel_pub.publish(stop)
-                    self.get_logger().warn("[LoRa] Max creep distance reached.")
-                    return False
 
             rssi = get_rssi()
             if rssi is not None:
