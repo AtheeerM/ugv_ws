@@ -30,8 +30,7 @@ RSSI_GOOD              = -70
 RSSI_WEAK              = -90
 RSSI_VERY_WEAK         = -100
 CREEP_SPEED            = 0.08  # m/s forward creep
-CREEP_TIMEOUT          = 2.0   # seconds before giving up creep
-CREEP_CHECK_INTERVAL   = 0.5   # seconds between RSSI checks while creeping
+CREEP_CHECK_INTERVAL   = 0.5   # seconds per forward step while creeping
 
 # ------------------------------------------------------------------
 # Unified goal definitions — one place, no index lookup ever needed
@@ -480,28 +479,60 @@ class Greedy4Goals(Node):
             f"[LoRa] Weak signal ({rssi} dBm). Rotating to find best heading..."
         )
 
-        # ── Phase 2: rotate, stop THE MOMENT signal drops from peak ─
+        # ── Phase 2: probe both directions, commit to the better one ──
         #
-        # We record `best_rssi` as the highest seen so far and
-        # `best_elapsed` as the time at which it occurred.
-        # As soon as any new reading falls below `best_rssi` (even by
-        # 1 dBm) AND we have already improved from the arrival RSSI,
-        # we stop immediately — the previous sample was the peak.
-        best_rssi        = rssi    # best seen so far
-        best_elapsed     = 0.0    # timestamp of best reading
-        drops_after_peak = 0      # consecutive meaningful drops below peak
-        rotation_speed   = 0.2   # rad/s — must match rotate_ccw.angular.z
-        full_rotation    = (2 * math.pi) / rotation_speed  # ~31 s max
+        # Rotate CCW for PROBE_TIME → sample RSSI (rssi_ccw)
+        # Rotate CW for 2×PROBE_TIME (back past start) → sample RSSI (rssi_cw)
+        # Commit to whichever direction had the stronger signal, then
+        # keep rotating that way until the 2-drop/2dBm stop triggers.
+        # This avoids wasting a full 31s circle when the peak is close
+        # in the opposite direction.
+        PROBE_TIME     = 2.0
+        rotation_speed = 0.2   # rad/s
+        full_rotation  = (2 * math.pi) / rotation_speed  # ~31s
 
+        # — Probe CCW —
         self.cmd_vel_pub.publish(rotate_ccw)
-        rot_start = time.time()
+        time.sleep(PROBE_TIME)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+        rssi_ccw = sample_rssi(0.5)
+        self.get_logger().info(f"[LoRa] Probe CCW: RSSI={rssi_ccw} dBm")
 
-        while time.time() - rot_start < full_rotation:
+        # — Probe CW (swing back past start by PROBE_TIME) —
+        self.cmd_vel_pub.publish(rotate_cw)
+        time.sleep(PROBE_TIME * 2)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+        rssi_cw = sample_rssi(0.5)
+        self.get_logger().info(f"[LoRa] Probe CW:  RSSI={rssi_cw} dBm")
+
+        # — Pick direction with stronger signal —
+        if rssi_ccw is not None and (rssi_cw is None or rssi_ccw >= rssi_cw):
+            commit_dir = rotate_ccw
+            dir_label  = "CCW"
+        else:
+            commit_dir = rotate_cw
+            dir_label  = "CW"
+
+        best_rssi        = max(r for r in [rssi, rssi_ccw, rssi_cw] if r is not None)
+        drops_after_peak = 0
+
+        self.get_logger().info(
+            f"[LoRa] Committing {dir_label} "
+            f"(CCW={rssi_ccw} dBm, CW={rssi_cw} dBm)"
+        )
+
+        # ── Phase 3: rotate in committed direction until peak passes ──
+        self.cmd_vel_pub.publish(commit_dir)
+        commit_start = time.time()
+
+        while time.time() - commit_start < full_rotation:
             r = get_rssi()
             if r is not None:
-                elapsed = time.time() - rot_start
+                elapsed = time.time() - commit_start
                 self.get_logger().info(
-                    f"[LoRa] Rotating... RSSI={r} dBm | {rssi_description(r)}"
+                    f"[LoRa] Rotating {dir_label}... RSSI={r} dBm | {rssi_description(r)}"
                 )
 
                 if r >= RSSI_CONFIRM_THRESHOLD:
@@ -511,148 +542,156 @@ class Greedy4Goals(Node):
                     return True
 
                 if r > best_rssi:
-                    # New peak — reset drop counter and keep going
                     best_rssi        = r
-                    best_elapsed     = elapsed
                     drops_after_peak = 0
                 elif best_rssi > rssi and r <= best_rssi - 2:
-                    # ≥2 dBm below peak (filters ±1 dBm noise)
                     drops_after_peak += 1
                     if drops_after_peak >= 2:
-                        # Two consecutive meaningful drops → peak is behind us
                         self.get_logger().info(
-                            f"[LoRa] Peak passed, stopping rotation at t={elapsed:.1f}s "
-                            f"(peak={best_rssi} dBm at t={best_elapsed:.1f}s, "
-                            f"now={r} dBm)"
+                            f"[LoRa] Peak passed at t={elapsed:.1f}s, "
+                            f"peak={best_rssi} dBm, now={r} dBm"
                         )
                         break
                 else:
-                    drops_after_peak = 0  # single-dBm noise — ignore
+                    drops_after_peak = 0
 
             time.sleep(0.3)
 
         self.cmd_vel_pub.publish(stop)
         time.sleep(0.3)
+        self.get_logger().info(f"[LoRa] Best heading found. Peak RSSI={best_rssi} dBm")
 
+        rssi_at_heading = sample_rssi(1.0)
         self.get_logger().info(
-            f"[LoRa] Best heading at t={best_elapsed:.1f}s RSSI={best_rssi} dBm"
+            f"[LoRa] At best heading. RSSI={rssi_at_heading} dBm"
         )
 
-        # ── Phase 3: rotate back CW, guided by RSSI (not time-blind) ──
-        #
-        # Time-based rotate-back is unreliable — actual angular velocity
-        # differs from the commanded value, causing multi-dBm errors.
-        # Instead, rotate CW while watching RSSI; stop when RSSI peaks
-        # and then drops again (same 2-drop/2dBm logic as forward scan).
-        elapsed_now   = time.time() - rot_start
-        time_to_best  = elapsed_now - best_elapsed
-        # Allow slightly more than time_to_best so we don't undershoot
-        max_back_time = time_to_best + 2.0
-
-        self.get_logger().info(
-            f"[LoRa] Rotating back (~{time_to_best:.1f}s) to best heading, "
-            f"RSSI-guided..."
-        )
-
-        back_best_rssi        = None
-        back_drops_after_peak = 0
-
-        self.cmd_vel_pub.publish(rotate_cw)
-        back_start = time.time()
-
-        while time.time() - back_start < max_back_time:
-            r = get_rssi()
-            if r is not None:
-                self.get_logger().info(f"[LoRa] Rotating back... RSSI={r} dBm")
-
-                if r >= RSSI_CONFIRM_THRESHOLD:
-                    self.cmd_vel_pub.publish(stop)
-                    self.get_logger().info(
-                        f"[LoRa] {expected_tag} CONFIRMED while rotating back! RSSI={r}")
-                    return True
-
-                if back_best_rssi is None or r > back_best_rssi:
-                    back_best_rssi        = r
-                    back_drops_after_peak = 0
-                elif back_best_rssi is not None and r <= back_best_rssi - 2:
-                    back_drops_after_peak += 1
-                    if back_drops_after_peak >= 2:
-                        self.get_logger().info(
-                            f"[LoRa] Peak found while rotating back. "
-                            f"RSSI={back_best_rssi} dBm, stopping."
-                        )
-                        break
-                else:
-                    back_drops_after_peak = 0
-            time.sleep(0.3)
-
-        self.cmd_vel_pub.publish(stop)
-        time.sleep(0.5)
-
-        rssi_after_rotate = sample_rssi(1.0)
-        self.get_logger().info(
-            f"[LoRa] At best heading. RSSI={rssi_after_rotate} dBm"
-        )
-
-        if rssi_after_rotate and rssi_after_rotate >= RSSI_CONFIRM_THRESHOLD:
+        if rssi_at_heading and rssi_at_heading >= RSSI_CONFIRM_THRESHOLD:
             self.get_logger().info(f"[LoRa] {expected_tag} CONFIRMED at best heading!")
             return True
 
-        # ── Phase 4: creep — stop THE INSTANT signal weakens ────────
+        # ── Phase 4: align → burst → re-align if signal drops ───────
         #
-        # Any reading that is lower than the previous one triggers an
-        # immediate stop + brief back-up. No consecutive-drop window.
-        self.get_logger().info("[LoRa] Creeping toward tag...")
-        start_pose        = self.get_robot_pose()
-        last_rssi         = rssi_after_rotate or best_rssi
-        go_forward        = True
-        consecutive_drops = 0
-        deadline          = time.time() + CREEP_TIMEOUT
+        # Each cycle:
+        #   1. Probe ±ALIGN_TIME to find the strongest heading
+        #   2. Drive forward in short steps, checking RSSI each step
+        #   3. Confirm immediately if RSSI ≥ threshold
+        #   4. If signal drops → back up, re-align, try again
+        #   5. Never drive forward when signal is getting weaker
+        ALIGN_TIME  = 1.0    # seconds per probe direction
+        STEP_TIME   = 0.5    # seconds per forward step
+        MAX_CYCLES  = 5      # max align+burst attempts before giving up
 
-        while time.time() < deadline:
+        current_rssi = rssi_at_heading or best_rssi
 
-            rssi = get_rssi()
-            if rssi is not None:
+        for cycle in range(MAX_CYCLES):
+            self.get_logger().info(
+                f"[LoRa] Cycle {cycle+1}/{MAX_CYCLES} — aligning heading..."
+            )
+
+            # ── 1. Probe ± to find best heading ──────────────────────
+            self.cmd_vel_pub.publish(rotate_ccw)
+            time.sleep(ALIGN_TIME)
+            self.cmd_vel_pub.publish(stop)
+            time.sleep(0.2)
+            probe_ccw = sample_rssi(0.3)
+
+            self.cmd_vel_pub.publish(rotate_cw)
+            time.sleep(ALIGN_TIME * 2)
+            self.cmd_vel_pub.publish(stop)
+            time.sleep(0.2)
+            probe_cw = sample_rssi(0.3)
+
+            # Return to centre
+            self.cmd_vel_pub.publish(rotate_ccw)
+            time.sleep(ALIGN_TIME)
+            self.cmd_vel_pub.publish(stop)
+            time.sleep(0.2)
+
+            self.get_logger().info(
+                f"[LoRa] Probe — CCW={probe_ccw} dBm, CW={probe_cw} dBm, "
+                f"centre={current_rssi} dBm"
+            )
+
+            # Check confirm during probing
+            for p in [probe_ccw, probe_cw]:
+                if p is not None and p >= RSSI_CONFIRM_THRESHOLD:
+                    self.get_logger().info(
+                        f"[LoRa] {expected_tag} CONFIRMED during alignment! RSSI={p}")
+                    return True
+
+            # Rotate toward the strongest direction if it beats centre
+            best_probe = max(
+                (r for r in [probe_ccw, probe_cw] if r is not None),
+                default=current_rssi
+            )
+            if best_probe > current_rssi:
+                if probe_ccw is not None and probe_ccw == best_probe:
+                    self.cmd_vel_pub.publish(rotate_ccw)
+                    time.sleep(ALIGN_TIME)
+                    self.cmd_vel_pub.publish(stop)
+                    self.get_logger().info(f"[LoRa] Turned CCW → RSSI={probe_ccw} dBm")
+                    current_rssi = probe_ccw
+                elif probe_cw is not None and probe_cw == best_probe:
+                    self.cmd_vel_pub.publish(rotate_cw)
+                    time.sleep(ALIGN_TIME)
+                    self.cmd_vel_pub.publish(stop)
+                    self.get_logger().info(f"[LoRa] Turned CW → RSSI={probe_cw} dBm")
+                    current_rssi = probe_cw
+            else:
+                self.get_logger().info("[LoRa] Heading optimal, no rotation needed.")
+
+            time.sleep(0.2)
+
+            # ── 2. Burst: drive forward step by step ─────────────────
+            self.get_logger().info("[LoRa] Driving burst toward tag...")
+            last_rssi         = get_rssi() or current_rssi
+            consecutive_drops = 0
+            signal_dropped    = False
+
+            while True:
+                self.cmd_vel_pub.publish(creep_fwd)
+                time.sleep(STEP_TIME)
+                self.cmd_vel_pub.publish(stop)
+                time.sleep(0.2)
+
+                rssi = get_rssi()
+                if rssi is None:
+                    continue
+
                 self.get_logger().info(
-                    f"[LoRa] Creeping... RSSI={rssi} dBm | {rssi_description(rssi)}"
+                    f"[LoRa] Step RSSI={rssi} dBm | {rssi_description(rssi)}"
                 )
 
+                # ── 3. Confirm ────────────────────────────────────────
                 if rssi >= RSSI_CONFIRM_THRESHOLD:
-                    self.cmd_vel_pub.publish(stop)
                     self.get_logger().info(
                         f"[LoRa] {expected_tag} CONFIRMED! RSSI={rssi}")
                     return True
 
+                # ── 4. Stop if signal is dropping ─────────────────────
                 if rssi <= last_rssi - 2:
-                    # Meaningful drop (≥2 dBm — not just noise)
                     consecutive_drops += 1
                     if consecutive_drops >= 2:
-                        # Two consecutive real drops → we're moving away
-                        self.cmd_vel_pub.publish(stop)
                         self.get_logger().warn(
-                            f"[LoRa] Signal dropping ({last_rssi}→{rssi} dBm), "
-                            f"backing up and holding..."
+                            f"[LoRa] Signal dropping ({last_rssi}→{rssi} dBm) "
+                            f"— backing up and re-aligning..."
                         )
-                        recover = creep_bwd if go_forward else creep_fwd
-                        self.cmd_vel_pub.publish(recover)
+                        self.cmd_vel_pub.publish(creep_bwd)
                         time.sleep(0.5)
                         self.cmd_vel_pub.publish(stop)
-                        time.sleep(2.0)   # hold — let RSSI stabilise
-                        go_forward        = not go_forward
-                        consecutive_drops = 0
-                        last_rssi         = get_rssi() or rssi
-                        continue
+                        current_rssi = get_rssi() or rssi
+                        signal_dropped = True
+                        break
                 else:
                     consecutive_drops = 0
-                    last_rssi = rssi
-
-            direction = creep_fwd if go_forward else creep_bwd
-            self.cmd_vel_pub.publish(direction)
-            time.sleep(CREEP_CHECK_INTERVAL)
+                    last_rssi  = rssi
+                    current_rssi = rssi
 
         self.cmd_vel_pub.publish(stop)
         self.get_logger().warn(
-            f"[LoRa] Timeout for {expected_tag}. Final RSSI={get_rssi()} dBm.")
+            f"[LoRa] Gave up after {MAX_CYCLES} cycles. "
+            f"Final RSSI={get_rssi()} dBm.")
         return False
 
     # ------------------------------------------------------------------
