@@ -107,7 +107,7 @@ class UgvDriver(Node):
             threading.Thread(
                 target=lambda: (
                     subprocess.run(['aplay', '-D', 'plughw:3,0', 
-                        '/mnt/ssd/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/low_battery.wav']),
+                        '/home/jaj/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/low_battery.wav']),
                     time.sleep(5)
                 ), daemon=True
             ).start()
