@@ -24,7 +24,7 @@ CHEAPER_THRESHOLD = 0.75
 # ------------------------------------------------------------------
 # LoRa / RSSI constants
 # ------------------------------------------------------------------
-RSSI_CONFIRM_THRESHOLD = -50   # minimum RSSI to confirm tag
+RSSI_CONFIRM_THRESHOLD = -60   # minimum RSSI to confirm tag
 RSSI_EXCELLENT         = -50
 RSSI_GOOD              = -70
 RSSI_WEAK              = -90
@@ -435,9 +435,12 @@ class Greedy4Goals(Node):
         stop      = Twist()
         creep_fwd = Twist(); creep_fwd.linear.x =  CREEP_SPEED
         creep_bwd = Twist(); creep_bwd.linear.x = -CREEP_SPEED
-        rotate_cw = Twist(); rotate_cw.angular.z  = -0.2
-        rotate_ccw= Twist(); rotate_ccw.angular.z =  0.2
-
+        rotate_cw = Twist(); rotate_cw.angular.z  = -0.3
+        rotate_ccw= Twist(); rotate_ccw.angular.z =  0.3
+        for _ in range(10):
+            self.cmd_vel_pub.publish(stop)
+            time.sleep(0.1)
+        time.sleep(1.5)
         def get_rssi():
             with self._lora_lock:
                 entry = self._lora_last_seen.get(expected_tag)
