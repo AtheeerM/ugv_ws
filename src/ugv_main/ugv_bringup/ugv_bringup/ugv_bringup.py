@@ -13,7 +13,7 @@ import math
 import os
 
 def is_jetson():
-    result = any("ugv_jetson" in root for root, dirs, files in os.walk("/"))
+    result = os.path.exists("/etc/nv_tegra_release")
     return result
 
 if is_jetson():
