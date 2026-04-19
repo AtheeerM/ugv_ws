@@ -479,66 +479,74 @@ class Greedy4Goals(Node):
             f"[LoRa] Weak signal ({rssi} dBm). Rotating to find best heading..."
         )
 
-        # ── Phase 2: probe both directions, commit to the better one ──
+        # ── Phase 2: quick coarse probe to pick the better side ──────
         #
-        # Rotate CCW for PROBE_TIME → sample RSSI (rssi_ccw)
-        # Rotate CW for 2×PROBE_TIME (back past start) → sample RSSI (rssi_cw)
-        # Commit to whichever direction had the stronger signal, then
-        # keep rotating that way until the 2-drop/2dBm stop triggers.
-        # This avoids wasting a full 31s circle when the peak is close
-        # in the opposite direction.
-        PROBE_TIME     = 2.0
-        rotation_speed = 0.2   # rad/s
-        full_rotation  = (2 * math.pi) / rotation_speed  # ~31s
+        # Probe CCW 3s (~34°) → sample.
+        # Probe CW 6s (back + 3s past) → sample.
+        # Pick the side with stronger signal.
+        # Then fine-scan only that side until peak passes.
+        COARSE_TIME    = 3.0   # seconds per coarse probe (~34° at 0.2 rad/s)
+        FINE_TIME      = 8.0   # max seconds for fine scan (~90°)
+        rotation_speed = 0.2
 
         # — Probe CCW —
         self.cmd_vel_pub.publish(rotate_ccw)
-        time.sleep(PROBE_TIME)
+        time.sleep(COARSE_TIME)
         self.cmd_vel_pub.publish(stop)
         time.sleep(0.3)
         rssi_ccw = sample_rssi(0.5)
-        self.get_logger().info(f"[LoRa] Probe CCW: RSSI={rssi_ccw} dBm")
+        self.get_logger().info(f"[LoRa] Coarse CCW: RSSI={rssi_ccw} dBm")
 
-        # — Probe CW (swing back past start by PROBE_TIME) —
+        # — Probe CW (swing back past start by COARSE_TIME) —
         self.cmd_vel_pub.publish(rotate_cw)
-        time.sleep(PROBE_TIME * 2)
+        time.sleep(COARSE_TIME * 2)
         self.cmd_vel_pub.publish(stop)
         time.sleep(0.3)
         rssi_cw = sample_rssi(0.5)
-        self.get_logger().info(f"[LoRa] Probe CW:  RSSI={rssi_cw} dBm")
+        self.get_logger().info(f"[LoRa] Coarse CW:  RSSI={rssi_cw} dBm")
 
-        # — Pick direction with stronger signal —
+        # — Return to start heading —
+        self.cmd_vel_pub.publish(rotate_ccw)
+        time.sleep(COARSE_TIME)
+        self.cmd_vel_pub.publish(stop)
+        time.sleep(0.3)
+
+        # — Pick the stronger side —
         if rssi_ccw is not None and (rssi_cw is None or rssi_ccw >= rssi_cw):
-            commit_dir = rotate_ccw
-            dir_label  = "CCW"
+            fine_dir   = rotate_ccw
+            fine_label = "CCW"
+            best_rssi  = rssi_ccw
         else:
-            commit_dir = rotate_cw
-            dir_label  = "CW"
+            fine_dir   = rotate_cw
+            fine_label = "CW"
+            best_rssi  = rssi_cw
 
-        best_rssi        = max(r for r in [rssi, rssi_ccw, rssi_cw] if r is not None)
-        drops_after_peak = 0
-
+        best_rssi = max(r for r in [rssi, best_rssi] if r is not None)
         self.get_logger().info(
-            f"[LoRa] Committing {dir_label} "
+            f"[LoRa] Chosen side: {fine_label} "
             f"(CCW={rssi_ccw} dBm, CW={rssi_cw} dBm)"
         )
 
-        # ── Phase 3: rotate in committed direction until peak passes ──
-        self.cmd_vel_pub.publish(commit_dir)
-        commit_start = time.time()
+        # ── Phase 3: fine scan on chosen side only ────────────────────
+        #
+        # Rotate in the chosen direction, stop when peak passes
+        # (2 consecutive drops of ≥2 dBm). Max FINE_TIME seconds.
+        drops_after_peak = 0
+        self.cmd_vel_pub.publish(fine_dir)
+        fine_start = time.time()
 
-        while time.time() - commit_start < full_rotation:
+        while time.time() - fine_start < FINE_TIME:
             r = get_rssi()
             if r is not None:
-                elapsed = time.time() - commit_start
+                elapsed = time.time() - fine_start
                 self.get_logger().info(
-                    f"[LoRa] Rotating {dir_label}... RSSI={r} dBm | {rssi_description(r)}"
+                    f"[LoRa] Fine {fine_label}... RSSI={r} dBm | {rssi_description(r)}"
                 )
 
                 if r >= RSSI_CONFIRM_THRESHOLD:
                     self.cmd_vel_pub.publish(stop)
                     self.get_logger().info(
-                        f"[LoRa] {expected_tag} CONFIRMED while rotating! RSSI={r}")
+                        f"[LoRa] {expected_tag} CONFIRMED during fine scan! RSSI={r}")
                     return True
 
                 if r > best_rssi:
@@ -548,7 +556,7 @@ class Greedy4Goals(Node):
                     drops_after_peak += 1
                     if drops_after_peak >= 2:
                         self.get_logger().info(
-                            f"[LoRa] Peak passed at t={elapsed:.1f}s, "
+                            f"[LoRa] Peak found at t={elapsed:.1f}s, "
                             f"peak={best_rssi} dBm, now={r} dBm"
                         )
                         break
@@ -559,7 +567,9 @@ class Greedy4Goals(Node):
 
         self.cmd_vel_pub.publish(stop)
         time.sleep(0.3)
-        self.get_logger().info(f"[LoRa] Best heading found. Peak RSSI={best_rssi} dBm")
+        self.get_logger().info(
+            f"[LoRa] Best heading found. Peak RSSI={best_rssi} dBm"
+        )
 
         rssi_at_heading = sample_rssi(1.0)
         self.get_logger().info(
@@ -578,9 +588,10 @@ class Greedy4Goals(Node):
         #   3. Confirm immediately if RSSI ≥ threshold
         #   4. If signal drops → back up, re-align, try again
         #   5. Never drive forward when signal is getting weaker
-        ALIGN_TIME  = 1.0    # seconds per probe direction
-        STEP_TIME   = 0.5    # seconds per forward step
-        MAX_CYCLES  = 5      # max align+burst attempts before giving up
+        ALIGN_TIME      = 3.0    # seconds per probe direction (~34° at 0.2 rad/s)
+        STEP_TIME       = 0.5    # seconds per forward step
+        BURST_MAX_STEPS = 5      # max steps per burst before re-aligning
+        MAX_CYCLES      = 5      # max align+burst attempts before giving up
 
         current_rssi = rssi_at_heading or best_rssi
 
@@ -649,7 +660,7 @@ class Greedy4Goals(Node):
             consecutive_drops = 0
             signal_dropped    = False
 
-            while True:
+            for step in range(BURST_MAX_STEPS):
                 self.cmd_vel_pub.publish(creep_fwd)
                 time.sleep(STEP_TIME)
                 self.cmd_vel_pub.publish(stop)
