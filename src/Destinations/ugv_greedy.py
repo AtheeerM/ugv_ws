@@ -36,10 +36,10 @@ CREEP_CHECK_INTERVAL   = 0.5   # seconds per forward step while creeping
 # Unified goal definitions — one place, no index lookup ever needed
 # ------------------------------------------------------------------
 GOAL_DEFS = [
-    {"x": 1.43,   "y":  0.168, "yaw": 0.000866, "tag": "TAG_001"},
-    {"x": 1.22,  "y": -1.72,  "yaw": 0.0021, "tag": "TAG_002"},
-    {"x": 0.60, "y": -1.70, "yaw": 0.00252, "tag": "TAG_003"},
-    {"x": 0.658, "y": -0.3730, "yaw": 0.00391, "tag": "TAG_004"},
+    {"x": 3.1,   "y":  0.513, "yaw": 0.00335, "tag": "TAG_001"},
+    {"x": 1.88,  "y": -1.91,  "yaw": 0.00206, "tag": "TAG_002"},
+    {"x": 3.72, "y": -4.22, "yaw": 0.00218, "tag": "TAG_003"},
+    {"x": 0.899, "y": -4.03, "yaw": 0.00666, "tag": "TAG_004"},
 ]
 
 
