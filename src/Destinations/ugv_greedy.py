@@ -33,34 +33,32 @@ CREEP_SPEED            = 0.08
 CREEP_CHECK_INTERVAL   = 0.5
 
 # ------------------------------------------------------------------
-# ── Logging configuration ─────────────────────────────────────────
-# File 1: one row every 5 s during Nav2 navigation (x,y,t per segment)
-# File 2: one row per waypoint with the final arrival result after LoRa
+# Logging configuration
 # ------------------------------------------------------------------
-LOG_DIR       = os.path.expanduser("~/robot_logs")
-NAV_LOG_FILE  = os.path.join(LOG_DIR, "nav_trajectory.csv")
-LORA_LOG_FILE = os.path.join(LOG_DIR, "lora_arrivals.csv")
-NAV_LOG_INTERVAL = 5.0   # seconds between pose samples in file 1
+LOG_DIR          = os.path.expanduser("~/robot_logs")
+NAV_LOG_FILE     = os.path.join(LOG_DIR, "nav_trajectory.csv")
+LORA_LOG_FILE    = os.path.join(LOG_DIR, "lora_arrivals.csv")
+NAV_LOG_INTERVAL = 5.0   # seconds between pose samples
 
 # ------------------------------------------------------------------
 # Goal definitions
 # ------------------------------------------------------------------
 GOAL_DEFS = [
-    {"x": 1.43,   "y":  0.168, "yaw": 0.000866, "tag": "TAG_001"},
-    {"x": 1.22,  "y": -1.72,  "yaw": 0.0021, "tag": "TAG_002"},
-    {"x": 0.60, "y": -1.70, "yaw": 0.00252, "tag": "TAG_003"},
-    {"x": 0.658, "y": -0.3730, "yaw": 0.00391, "tag": "TAG_004"},
+    {"x": 3.1,   "y":  0.513, "yaw": 0.00335, "tag": "TAG_001"},
+    {"x": 1.88,  "y": -1.91,  "yaw": 0.00206, "tag": "TAG_002"},
+    {"x": 3.72,  "y": -4.22,  "yaw": 0.00218, "tag": "TAG_003"},
+    {"x": 0.899, "y": -4.03,  "yaw": 0.00666, "tag": "TAG_004"},
 ]
 
 
 def rssi_description(rssi):
-    if rssi is None:                       return "No signal"
-    elif rssi >= RSSI_EXCELLENT:           return "Excellent"
-    elif rssi >= RSSI_GOOD:               return "Good"
-    elif rssi >= RSSI_CONFIRM_THRESHOLD:  return "OK - above threshold"
-    elif rssi >= RSSI_WEAK:              return "Weak - creeping"
-    elif rssi >= RSSI_VERY_WEAK:         return "Very Weak"
-    else:                                 return "No signal / noise"
+    if rssi is None:                      return "No signal"
+    elif rssi >= RSSI_EXCELLENT:          return "Excellent"
+    elif rssi >= RSSI_GOOD:              return "Good"
+    elif rssi >= RSSI_CONFIRM_THRESHOLD: return "OK - above threshold"
+    elif rssi >= RSSI_WEAK:             return "Weak - creeping"
+    elif rssi >= RSSI_VERY_WEAK:        return "Very Weak"
+    else:                                return "No signal / noise"
 
 
 def yaw_to_quat(yaw):
@@ -68,13 +66,13 @@ def yaw_to_quat(yaw):
 
 
 def pose_from_tf(tf_stamped, frame_id):
-    t = tf_stamped.transform
+    t  = tf_stamped.transform
     ps = PoseStamped()
-    ps.header.frame_id = frame_id
-    ps.header.stamp    = tf_stamped.header.stamp
-    ps.pose.position.x = t.translation.x
-    ps.pose.position.y = t.translation.y
-    ps.pose.position.z = t.translation.z
+    ps.header.frame_id    = frame_id
+    ps.header.stamp       = tf_stamped.header.stamp
+    ps.pose.position.x    = t.translation.x
+    ps.pose.position.y    = t.translation.y
+    ps.pose.position.z    = t.translation.z
     ps.pose.orientation.x = t.rotation.x
     ps.pose.orientation.y = t.rotation.y
     ps.pose.orientation.z = t.rotation.z
@@ -130,13 +128,12 @@ class Greedy4Goals(Node):
             for d in GOAL_DEFS
         ]
 
-        # ── Trajectory logging ──────────────────────────────────────
-        # _from_label tracks where the robot currently is (for segment names)
-        self._from_label     = "HOME"
-        self._nav_log_stop   = threading.Event()
-        self._nav_log_thread = None
-        self._lora_file_lock      = threading.Lock()  # protects direct appends to File 2
-        self._mission_start_time  = None              # set once on first nav goal, never reset
+        # ── Trajectory logging ─────────────────────────────────────
+        self._from_label         = "HOME"
+        self._nav_log_stop       = threading.Event()
+        self._nav_log_thread     = None
+        self._lora_file_lock     = threading.Lock()
+        self._mission_start_time = None   # set once on first nav goal, never reset
         self._init_log_files()
         self.get_logger().info(
             f"Logging nav to:  {NAV_LOG_FILE}\n"
@@ -159,38 +156,29 @@ class Greedy4Goals(Node):
     # ==================================================================
 
     def _init_log_files(self):
-        """Create log directory and write CSV headers (once per run)."""
+        """Create log directory and ALWAYS overwrite both files on startup."""
         os.makedirs(LOG_DIR, exist_ok=True)
 
-        # Shared header builder — File 2 extends File 1 with three extra columns
         nav_header  = ['segment', 'elapsed_s', 'ros_time_s', 'x', 'y',
-                        'goal_x', 'goal_y', 'goal_tag']
+                       'goal_x', 'goal_y', 'goal_tag']
         lora_header = nav_header + ['phase', 'rssi_dbm', 'lora_confirmed']
-        # phase values used in File 2:
+        # phase values in File 2:
         #   "nav2"   — pose sample every 5 s while Nav2 is driving
         #   "lora"   — pose + RSSI sample during LoRa approach steps
-        #   "result" — final row: outcome of the LoRa confirmation attempt
+        #   "result" — final row for a real waypoint goal
+        #   "home"   — final row for home return (no LoRa involved)
 
         for path, header in [(NAV_LOG_FILE, nav_header),
                               (LORA_LOG_FILE, lora_header)]:
-            if not os.path.exists(path):
-                with open(path, 'w', newline='') as f:
-                    csv.writer(f).writerow(header)
-            else:
-                # Blank separator line between runs so MATLAB can tell them apart
-                with open(path, 'a', newline='') as f:
-                    csv.writer(f).writerow([])
+            with open(path, 'w', newline='') as f:   # 'w' truncates on every run
+                csv.writer(f).writerow(header)
 
     # ------------------------------------------------------------------
     # File 1 + File 2 nav-phase logger (background thread)
-    # Writes to File 1 (nav_trajectory.csv) every NAV_LOG_INTERVAL seconds.
-    # Simultaneously writes the same row to File 2 (lora_arrivals.csv) with
-    # phase="nav2" and blank rssi_dbm / lora_confirmed columns.
     # ------------------------------------------------------------------
 
-    def _nav_log_worker(self, segment: str, goal: PoseStamped, goal_tag: str,
-                        seg_start: float):
-        """Background thread: records robot pose every NAV_LOG_INTERVAL seconds."""
+    def _nav_log_worker(self, segment: str, goal: PoseStamped,
+                        goal_tag: str, seg_start: float):
         with open(NAV_LOG_FILE,  'a', newline='') as f1, \
              open(LORA_LOG_FILE, 'a', newline='') as f2:
             w1 = csv.writer(f1)
@@ -211,14 +199,13 @@ class Greedy4Goals(Node):
                     f2.flush()
                 self._nav_log_stop.wait(timeout=NAV_LOG_INTERVAL)
 
-    def _start_nav_logging(self, segment: str, goal: PoseStamped, goal_tag: str,
-                           seg_start: float):
+    def _start_nav_logging(self, segment: str, goal: PoseStamped,
+                           goal_tag: str, seg_start: float):
         self._nav_log_stop.clear()
         self._nav_log_thread = threading.Thread(
             target=self._nav_log_worker,
             args=(segment, goal, goal_tag, seg_start),
-            daemon=True,
-            name="nav_logger",
+            daemon=True, name="nav_logger",
         )
         self._nav_log_thread.start()
         self.get_logger().info(f"[LOG] Nav logging started — segment: {segment}")
@@ -231,10 +218,7 @@ class Greedy4Goals(Node):
         self.get_logger().info("[LOG] Nav logging stopped.")
 
     # ------------------------------------------------------------------
-    # File 2 — direct row append (called during LoRa phase and for result)
-    #
-    # phase="lora"   : one call per RSSI sample during the approach
-    # phase="result" : one call at the very end with confirmed=0/1
+    # File 2 — direct row append (LoRa phase samples and result rows)
     # ------------------------------------------------------------------
 
     def _append_lora_file_row(
@@ -243,20 +227,16 @@ class Greedy4Goals(Node):
         seg_start: float,
         goal:      PoseStamped,
         goal_tag:  str,
-        phase:     str,        # "lora" | "result"
-        rssi,                  # int | None
-        confirmed,             # '' during lora steps, 0/1 for result row
+        phase:     str,    # "lora" | "result" | "home"
+        rssi,              # int | None
+        confirmed,         # '' during lora steps, 0/1 for result/home row
     ):
         pose    = self.get_robot_pose()
         elapsed = round(time.time() - seg_start, 2)
         ros_t   = round(self.get_clock().now().nanoseconds / 1e9, 3)
 
-        if pose is not None:
-            rx = round(pose.pose.position.x, 4)
-            ry = round(pose.pose.position.y, 4)
-        else:
-            rx = ry = ''
-
+        rx = round(pose.pose.position.x, 4) if pose is not None else ''
+        ry = round(pose.pose.position.y, 4) if pose is not None else ''
         gx = round(goal.pose.position.x, 4)
         gy = round(goal.pose.position.y, 4)
 
@@ -271,7 +251,7 @@ class Greedy4Goals(Node):
                 ])
 
     # ==================================================================
-    # ── Existing node methods (unchanged except where noted) ──────────
+    # ── Node methods ──────────────────────────────────────────────────
     # ==================================================================
 
     def _lora_callback(self, msg: String):
@@ -288,7 +268,7 @@ class Greedy4Goals(Node):
 
     def stop_robot(self):
         self._shutdown = True
-        self._stop_nav_logging()   # make sure logger is killed on shutdown
+        self._stop_nav_logging()
         if self._current_gh is not None:
             try:
                 cancel_future = self._current_gh.cancel_goal_async()
@@ -386,9 +366,9 @@ class Greedy4Goals(Node):
         if pose is None:
             return
         msg = PoseWithCovarianceStamped()
-        msg.header.frame_id   = "map"
-        msg.header.stamp      = self.get_clock().now().to_msg()
-        msg.pose.pose         = pose.pose
+        msg.header.frame_id    = "map"
+        msg.header.stamp       = self.get_clock().now().to_msg()
+        msg.pose.pose          = pose.pose
         msg.pose.covariance[0]  = 0.25
         msg.pose.covariance[7]  = 0.25
         msg.pose.covariance[35] = 0.1
@@ -396,6 +376,7 @@ class Greedy4Goals(Node):
         self.get_logger().info("AMCL relocalization triggered")
 
     def clear_costmaps(self):
+        """Clear local costmap (called mid-mission)."""
         self.get_logger().info(">>> Clearing local costmap...")
         try:
             result = subprocess.run(
@@ -410,8 +391,27 @@ class Greedy4Goals(Node):
                 self.get_logger().warn("    Clear failed (continuing anyway).")
         except Exception:
             self.get_logger().warn("    Clear timed out (continuing anyway).")
-        self.get_logger().info(">>> Waiting 3s to settle...")
+        self.get_logger().info(">>> Waiting 5s to settle...")
         time.sleep(5.0)
+
+    def _clear_global_costmap(self):
+        """Clear global costmap — called before home return to wipe
+        accumulated ghost obstacles from the entire mission."""
+        self.get_logger().info(">>> Clearing global costmap...")
+        try:
+            result = subprocess.run(
+                ["ros2", "service", "call",
+                 "/global_costmap/clear_entirely_global_costmap",
+                 "nav2_msgs/srv/ClearEntireCostmap", "{}"],
+                timeout=5, capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                self.get_logger().info("    Global costmap cleared.")
+            else:
+                self.get_logger().warn("    Global clear failed (continuing anyway).")
+        except Exception:
+            self.get_logger().warn("    Global clear timed out (continuing anyway).")
+        time.sleep(3.0)
 
     def _cancel_current_goal(self, reason=""):
         if self._current_gh is None:
@@ -522,15 +522,16 @@ class Greedy4Goals(Node):
 
     # ------------------------------------------------------------------
     # LoRa approach
-    # CHANGED: now returns (confirmed: bool, final_rssi: int | None)
-    # so the caller can log the RSSI into file 2.
     # ------------------------------------------------------------------
 
-    def _approach_via_lora(self, expected_tag: str, lora_log_fn=None):
+    def _approach_via_lora(self, expected_tag: str, goal: PoseStamped,
+                           lora_log_fn=None):
         """
         Returns (confirmed: bool, final_rssi: int | None)
-        lora_log_fn(rssi) — optional callback that writes one row to File 2
-        with phase="lora" and the current robot pose + rssi.
+
+        LoRa guard: if nav2 already stopped within LORA_GUARD_DISTANCE
+        of the target AND signal is weaker than RSSI_WEAK, skip all
+        movement and keep the nav2 position.
         """
         def _log(rssi):
             if lora_log_fn is not None:
@@ -561,14 +562,17 @@ class Greedy4Goals(Node):
         for _ in range(10):
             self.cmd_vel_pub.publish(stop)
             time.sleep(0.1)
-        time.sleep(1.5)
+
+        # Wait for AMCL to settle at the goal before reading pose/RSSI
+        self.get_logger().info("[LoRa] Waiting 3s for AMCL to settle...")
+        time.sleep(3.0)
 
         rssi = get_rssi()
         self.get_logger().info(
             f"[LoRa] Arrived at {expected_tag}. "
             f"RSSI={rssi} dBm | {rssi_description(rssi)}"
         )
-        _log(rssi)    # Phase 1 arrival check
+        _log(rssi)
 
         if rssi is None:
             self.get_logger().warn(f"[LoRa] {expected_tag} — no signal.")
@@ -581,8 +585,8 @@ class Greedy4Goals(Node):
         self.get_logger().warn(
             f"[LoRa] Weak signal ({rssi} dBm). Rotating to find best heading...")
 
-        COARSE_TIME    = 3.0
-        FINE_TIME      = 8.0
+        COARSE_TIME = 3.0
+        FINE_TIME   = 8.0
 
         self.cmd_vel_pub.publish(rotate_ccw)
         time.sleep(COARSE_TIME)
@@ -624,7 +628,7 @@ class Greedy4Goals(Node):
                 self.get_logger().info(
                     f"[LoRa] Fine {fine_label}... RSSI={r} dBm | {rssi_description(r)}"
                 )
-                _log(r)    # fine scan sample
+                _log(r)
                 if r >= RSSI_CONFIRM_THRESHOLD:
                     self.cmd_vel_pub.publish(stop)
                     self.get_logger().info(
@@ -651,7 +655,7 @@ class Greedy4Goals(Node):
         rssi_at_heading = sample_rssi(1.0)
         self.get_logger().info(
             f"[LoRa] At best heading. RSSI={rssi_at_heading} dBm")
-        _log(rssi_at_heading)    # best-heading sample
+        _log(rssi_at_heading)
 
         if rssi_at_heading and rssi_at_heading >= RSSI_CONFIRM_THRESHOLD:
             self.get_logger().info(f"[LoRa] {expected_tag} CONFIRMED at best heading!")
@@ -672,13 +676,13 @@ class Greedy4Goals(Node):
             time.sleep(ALIGN_TIME)
             self.cmd_vel_pub.publish(stop); time.sleep(0.2)
             probe_ccw = sample_rssi(0.3)
-            _log(probe_ccw)    # cycle CCW probe
+            _log(probe_ccw)
 
             self.cmd_vel_pub.publish(rotate_cw)
             time.sleep(ALIGN_TIME * 2)
             self.cmd_vel_pub.publish(stop); time.sleep(0.2)
             probe_cw = sample_rssi(0.3)
-            _log(probe_cw)     # cycle CW probe
+            _log(probe_cw)
 
             self.cmd_vel_pub.publish(rotate_ccw)
             time.sleep(ALIGN_TIME)
@@ -734,7 +738,7 @@ class Greedy4Goals(Node):
                 self.get_logger().info(
                     f"[LoRa] Step RSSI={rssi} dBm | {rssi_description(rssi)}"
                 )
-                _log(rssi)    # burst creep step
+                _log(rssi)
 
                 if rssi >= RSSI_CONFIRM_THRESHOLD:
                     self.get_logger().info(
@@ -751,7 +755,7 @@ class Greedy4Goals(Node):
                         time.sleep(0.5)
                         self.cmd_vel_pub.publish(stop)
                         current_rssi   = get_rssi() or rssi
-                        _log(current_rssi)    # post-backup position
+                        _log(current_rssi)
                         signal_dropped = True
                         break
                 else:
@@ -768,8 +772,6 @@ class Greedy4Goals(Node):
 
     # ------------------------------------------------------------------
     # Navigate with replan
-    # CHANGED: accepts `segment` for logging; integrates start/stop logging
-    #          and calls _log_lora_arrival once per succeeded goal.
     # ------------------------------------------------------------------
 
     def navigate_with_replan(
@@ -790,29 +792,34 @@ class Greedy4Goals(Node):
                 f"{goal.pose.position.y:.2f}) attempt {attempt}..."
             )
 
-            # ── Start logging pose every 5 s to File 1 and File 2 (nav2 phase)
+            # ── Start mission clock on first goal, never reset ─────
             if self._mission_start_time is None:
-                self._mission_start_time = time.time()   # set once, never reset
-            self._start_nav_logging(segment, goal, expected_tag or 'HOME',
+                self._mission_start_time = time.time()
+
+            self._start_nav_logging(segment, goal,
+                                    expected_tag or 'HOME',
                                     self._mission_start_time)
             result = self._drive_with_monitoring(goal, is_home=is_home)
             self._stop_nav_logging()
-            # ──────────────────────────────────────────────────────────────
 
             if result == 'succeeded':
                 self.get_logger().info(f"Goal SUCCEEDED on attempt {attempt}!")
 
-                # Callback used inside _approach_via_lora to write LoRa-phase rows
-                def lora_log_fn(rssi, _seg=segment,
-                                _goal=goal, _tag=expected_tag or 'HOME'):
-                    self._append_lora_file_row(
-                        _seg, self._mission_start_time, _goal, _tag, 'lora', rssi, '')
-
                 final_rssi = None
+
                 if expected_tag is not None:
+                    # Callback writes one lora-phase row per RSSI sample
+                    def lora_log_fn(rssi, _seg=segment,
+                                    _goal=goal, _tag=expected_tag):
+                        self._append_lora_file_row(
+                            _seg, self._mission_start_time,
+                            _goal, _tag, 'lora', rssi, '')
+
                     with self._lora_lock:
                         entry    = self._lora_last_seen.get(expected_tag)
-                        pre_rssi = entry[0] if entry and (time.time() - entry[1]) < 5.0 else None
+                        pre_rssi = (entry[0]
+                                    if entry and (time.time() - entry[1]) < 5.0
+                                    else None)
 
                     if pre_rssi is None:
                         self.get_logger().info(
@@ -822,7 +829,7 @@ class Greedy4Goals(Node):
                         lora_confirmed = False
                     else:
                         lora_confirmed, final_rssi = self._approach_via_lora(
-                            expected_tag, lora_log_fn=lora_log_fn)
+                            expected_tag, goal=goal, lora_log_fn=lora_log_fn)
                         if lora_confirmed:
                             self.get_logger().info(
                                 f"[RESULT] {expected_tag} — "
@@ -831,22 +838,29 @@ class Greedy4Goals(Node):
                         else:
                             self.get_logger().warn(
                                 f"[RESULT] {expected_tag} — "
-                                f"LoRa detected but not confirmed, "
+                                f"LoRa not confirmed, "
                                 f"accepted by Nav2 coordinates."
                             )
-                else:
-                    lora_confirmed = True   # home return always counts as success
 
-                # ── Write the closing result row to File 2 ─────────────
-                self._append_lora_file_row(
-                    segment, self._mission_start_time, goal, expected_tag or 'HOME',
-                    'result', final_rssi, int(lora_confirmed)
-                )
+                    # phase="result" for real waypoint goals
+                    self._append_lora_file_row(
+                        segment, self._mission_start_time, goal, expected_tag,
+                        'result', final_rssi, int(lora_confirmed)
+                    )
+
+                else:
+                    # Home return — no LoRa, phase="home" keeps it out of
+                    # accuracy metrics in MATLAB (result_rows = phase=="result")
+                    lora_confirmed = False
+                    self._append_lora_file_row(
+                        segment, self._mission_start_time, goal, 'HOME',
+                        'home', None, 0
+                    )
+
                 self.get_logger().info(
                     f"[LOG] Result row written — segment={segment} "
                     f"confirmed={lora_confirmed} rssi={final_rssi}"
                 )
-
                 return True, lora_confirmed
 
             elif result == 'switch_goal':
@@ -855,7 +869,7 @@ class Greedy4Goals(Node):
             elif result == 'failed':
                 if is_home:
                     self.get_logger().warn(
-                        f"Returning home — clearing and retrying.")
+                        "Returning home — clearing and retrying.")
                     self.clear_costmaps()
                     continue
                 robot = self.get_robot_pose()
@@ -880,8 +894,6 @@ class Greedy4Goals(Node):
 
     # ------------------------------------------------------------------
     # Main navigation loop
-    # CHANGED: builds segment label (e.g. "HOME→TAG_001") and passes it
-    #          to navigate_with_replan; updates _from_label after success.
     # ------------------------------------------------------------------
 
     def navigation_loop(self):
@@ -930,9 +942,7 @@ class Greedy4Goals(Node):
             best_score, best_idx = scored[0]
             goal, expected_tag = self.goals.pop(best_idx)
 
-            # ── Build segment label for this leg ──────────────────
             segment = f"{self._from_label}→{expected_tag}"
-
             self.get_logger().info(
                 f"GREEDY PICK: "
                 f"({goal.pose.position.x:.2f},{goal.pose.position.y:.2f}) | "
@@ -969,9 +979,7 @@ class Greedy4Goals(Node):
                         f"Robot at {pos} | {len(self.goals)} goals left."
                     )
 
-                # ── Advance from_label for next segment ───────────
                 self._from_label = expected_tag
-
                 self.get_logger().info("Waiting 5s for Nav2 to reset...")
                 time.sleep(5.0)
                 self.clear_costmaps()
@@ -987,9 +995,22 @@ class Greedy4Goals(Node):
             hy = self.home_pose.pose.position.y
             self.get_logger().info(
                 f"Returning to home ({hx:.2f},{hy:.2f})...")
-            self.clear_costmaps()
 
-            # ── Final segment: last tag → HOME ────────────────────
+            current = self.get_robot_pose()
+            if current is not None:
+                self.get_logger().info(
+                    f"Current pose before home: "
+                    f"({current.pose.position.x:.2f},"
+                    f"{current.pose.position.y:.2f})"
+                )
+
+            # Re-localize and clear both costmaps before home run
+            self.trigger_amcl_relocalize()
+            self.get_logger().info("Waiting 5s for AMCL to settle before home run...")
+            time.sleep(5.0)
+            self.clear_costmaps()
+            self._clear_global_costmap()
+
             home_segment = f"{self._from_label}→HOME"
             ok, _ = self.navigate_with_replan(
                 self.home_pose, expected_tag=None,
