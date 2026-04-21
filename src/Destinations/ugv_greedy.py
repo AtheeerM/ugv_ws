@@ -881,7 +881,7 @@ class Greedy4Goals(Node):
                 f"Returning to home ({hx:.2f},{hy:.2f})...")
             self.clear_costmaps()
             ok, _ = self.navigate_with_replan(
-                self.home_pose, expected_tag=None,MAX_RECOVERIES= 30)
+                self.home_pose, expected_tag=None,max_attempts= 30)
             if ok:
                 self.get_logger().info("MISSION COMPLETE! Robot returned home!")
             else:
