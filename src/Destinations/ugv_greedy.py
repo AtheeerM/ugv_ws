@@ -367,7 +367,7 @@ class Greedy4Goals(Node):
     # Mid-drive check
     # ------------------------------------------------------------------
 
-    def _mid_drive_check(self, current_goal):
+    def _mid_drive_check(self, current_goal,is_home=False):
         robot = self.get_robot_pose()
         if robot is None:
             return 'continue'
@@ -380,6 +380,8 @@ class Greedy4Goals(Node):
             self.get_logger().warn(
                 f"Too many recoveries ({self._recovery_count}) — switching goal")
             return 'too_many_recoveries'
+        if is_home:
+            return 'continue'
 
         current_cost = self.get_path_cost(robot, current_goal, timeout=3.0)
         if current_cost is None:
@@ -398,7 +400,7 @@ class Greedy4Goals(Node):
     # Drive with monitoring
     # ------------------------------------------------------------------
 
-    def _drive_with_monitoring(self, goal):
+    def _drive_with_monitoring(self, goal,is_home=False):
         gh, result_event, res_box = self._send_goal_async(goal)
 
         if gh is None:
@@ -408,10 +410,10 @@ class Greedy4Goals(Node):
         self.get_logger().info("Goal accepted! Monitoring mid-drive...")
 
         while not result_event.wait(timeout=CHECK_INTERVAL):
-            decision = self._mid_drive_check(goal)
+            decision = self._mid_drive_check(goal,is_home=is_home)
             if decision != 'continue':
                 self._cancel_current_goal(reason=decision)
-                return 'switch_goal'
+                return 'failed' if is_home else 'switch_goal'
 
         res = res_box[0]
         if res is not None and res.status == GoalStatus.STATUS_SUCCEEDED:
@@ -709,7 +711,7 @@ class Greedy4Goals(Node):
     # Navigate with replan
     # ------------------------------------------------------------------
 
-    def navigate_with_replan(self, goal, expected_tag=None, max_attempts=None):
+    def navigate_with_replan(self, goal, expected_tag=None, max_attempts=None,is_home=False):
         attempt        = 0
         lora_confirmed = False
 
@@ -724,7 +726,7 @@ class Greedy4Goals(Node):
                 f"{goal.pose.position.y:.2f}) attempt {attempt}..."
             )
 
-            result = self._drive_with_monitoring(goal)
+            result = self._drive_with_monitoring(goal,is_home=is_home)
 
             if result == 'succeeded':
                 self.get_logger().info(f"Goal SUCCEEDED on attempt {attempt}!")
@@ -759,6 +761,11 @@ class Greedy4Goals(Node):
                 return False, False
 
             elif result == 'failed':
+                if is_home:
+                    self.get_logger().warn(
+                        f"[HOME] Attempt {attempt} — clearing and retrying.")
+                    self.clear_costmaps()
+                    continue
                 robot = self.get_robot_pose()
                 if robot is not None:
                     current_cost = self.get_path_cost(robot, goal, timeout=3.0)
@@ -881,7 +888,7 @@ class Greedy4Goals(Node):
                 f"Returning to home ({hx:.2f},{hy:.2f})...")
             self.clear_costmaps()
             ok, _ = self.navigate_with_replan(
-                self.home_pose, expected_tag=None,max_attempts= 30)
+                self.home_pose, expected_tag=None,max_attempts=None,is_home=True)
             if ok:
                 self.get_logger().info("MISSION COMPLETE! Robot returned home!")
             else:
