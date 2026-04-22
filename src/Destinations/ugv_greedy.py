@@ -24,7 +24,7 @@ CHEAPER_THRESHOLD = 0.75
 # ------------------------------------------------------------------
 # LoRa / RSSI constants
 # ------------------------------------------------------------------
-RSSI_CONFIRM_THRESHOLD = -60
+RSSI_CONFIRM_THRESHOLD = -65
 RSSI_EXCELLENT         = -50
 RSSI_GOOD              = -70
 RSSI_WEAK              = -90
