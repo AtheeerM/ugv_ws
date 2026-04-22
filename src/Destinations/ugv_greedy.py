@@ -18,7 +18,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 # Tuning constants — Nav2
 # ------------------------------------------------------------------
 CHECK_INTERVAL    = 8.0
-MAX_RECOVERIES    = 10
+MAX_RECOVERIES    = 5
 CHEAPER_THRESHOLD = 0.75
 
 # ------------------------------------------------------------------
@@ -376,21 +376,24 @@ class Greedy4Goals(Node):
         self.get_logger().info("AMCL relocalization triggered")
 
     def clear_costmaps(self):
-        """Clear local costmap (called mid-mission)."""
         self.get_logger().info(">>> Clearing local costmap...")
-        try:
-            result = subprocess.run(
-                ["ros2", "service", "call",
-                 "/local_costmap/clear_entirely_local_costmap",
-                 "nav2_msgs/srv/ClearEntireCostmap", "{}"],
-                timeout=5, capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                self.get_logger().info("    Local costmap cleared.")
-            else:
-                self.get_logger().warn("    Clear failed (continuing anyway).")
-        except Exception:
-            self.get_logger().warn("    Clear timed out (continuing anyway).")
+        for attempt in range(3):   # retry up to 3 times
+            try:
+                result = subprocess.run(
+                    ["ros2", "service", "call",
+                    "/local_costmap/clear_entirely_local_costmap",
+                    "nav2_msgs/srv/ClearEntireCostmap", "{}"],
+                    timeout=8, capture_output=True, text=True  # longer timeout
+                )
+                if result.returncode == 0:
+                    self.get_logger().info("    Local costmap cleared.")
+                    break
+                else:
+                    self.get_logger().warn(f"    Clear failed attempt {attempt+1}, retrying...")
+                    time.sleep(2.0)
+            except Exception:
+                self.get_logger().warn(f"    Clear timed out attempt {attempt+1}, retrying...")
+                time.sleep(2.0)
         self.get_logger().info(">>> Waiting 5s to settle...")
         time.sleep(5.0)
 
@@ -795,7 +798,9 @@ class Greedy4Goals(Node):
             # ── Start mission clock on first goal, never reset ─────
             if self._mission_start_time is None:
                 self._mission_start_time = time.time()
-
+            # Pre-emptively relocalize before every attempt
+            self.trigger_amcl_relocalize()
+            time.sleep(2.0)
             self._start_nav_logging(segment, goal,
                                     expected_tag or 'HOME',
                                     self._mission_start_time)
