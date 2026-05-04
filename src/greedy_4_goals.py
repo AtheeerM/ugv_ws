@@ -36,10 +36,10 @@ class Greedy4Goals(Node):
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.goals = [
-            self.make_goal(-2.50,  7.00, 0.0),
-            self.make_goal(-3.58,  0.56, 0.0),
-            self.make_goal( 3.73,  6.49, 0.0),
-            self.make_goal(-2.50,  3.50, 0.0),
+            self.make_goal(-2.34,  1.32, 0.0),
+            self.make_goal(1.71,  0.978, 0.0),
+            self.make_goal(0.944,  -2.38, 0.0),
+            self.make_goal(-0.624,  -1.08, 0.0),
         ]
         # ✅ CHANGE 1: Save home position
         self.home_pose = None
