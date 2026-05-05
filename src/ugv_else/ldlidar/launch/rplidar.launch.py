@@ -35,7 +35,9 @@ def generate_launch_description():
 
         # "ranges and specifications" (your rplidar launch settings)
         {'angle_compensate': True},
+        {'scan_mode': 'Standard'},
       ]
+      
   )
 
   # base_link to base_laser tf node (keep SAME as your template)
