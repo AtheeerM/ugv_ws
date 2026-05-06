@@ -57,8 +57,8 @@ NAV_LOG_INTERVAL = 5.0   # seconds between pose samples
 GOAL_DEFS = [
     {"x": -2.34,   "y":  1.32, "yaw": 0.0, "tag": "TAG_001"},
     {"x": 0.944,  "y": -2.38,  "yaw": 0.0, "tag": "TAG_002"},
-    {"x": 1.71, "y": 0.978, "yaw": 0.0, "tag": "TAG_003"},
-    {"x": -0.237, "y": -0.652, "yaw": 0.0, "tag": "TAG_004"},
+    {"x": -0.237, "y": -0.652, "yaw": 0.0, "tag": "TAG_003"},
+    {"x": 1.71, "y": 0.978, "yaw": 0.0, "tag": "TAG_004"},
 ]
 
 
