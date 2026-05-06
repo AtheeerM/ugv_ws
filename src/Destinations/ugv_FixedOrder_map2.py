@@ -34,7 +34,7 @@ MAX_RECOVERIES = 7
 # ------------------------------------------------------------------
 # LoRa / RSSI constants
 # ------------------------------------------------------------------
-RSSI_CONFIRM_THRESHOLD = -65
+RSSI_CONFIRM_THRESHOLD = -68
 RSSI_EXCELLENT         = -50
 RSSI_GOOD              = -70
 RSSI_WEAK              = -90
