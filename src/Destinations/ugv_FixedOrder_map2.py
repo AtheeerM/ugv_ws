@@ -29,7 +29,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 # Tuning constants — Nav2
 # ------------------------------------------------------------------
 CHECK_INTERVAL = 8.0
-MAX_RECOVERIES = 7
+MAX_RECOVERIES = 9
 
 # ------------------------------------------------------------------
 # LoRa / RSSI constants
