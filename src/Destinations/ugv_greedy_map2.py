@@ -18,7 +18,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 # Tuning constants — Nav2
 # ------------------------------------------------------------------
 CHECK_INTERVAL    = 8.0
-MAX_RECOVERIES    = 5
+MAX_RECOVERIES    = 7
 CHEAPER_THRESHOLD = 0.75
 
 # ------------------------------------------------------------------
